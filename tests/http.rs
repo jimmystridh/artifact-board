@@ -22,7 +22,9 @@ impl Test {
                 client: None,
                 secret: None,
                 gated_tenant: None,
-                signing_key: None,
+                signing_key: Some(
+                    "synthetic-http-retry-test-key-not-production-000000000000000000000000".into(),
+                ),
             },
         )
         .unwrap();
@@ -52,7 +54,9 @@ impl Test {
                 client: None,
                 secret: None,
                 gated_tenant: None,
-                signing_key: None,
+                signing_key: Some(
+                    "synthetic-http-retry-test-key-not-production-000000000000000000000000".into(),
+                ),
             },
         );
         Self {
@@ -121,7 +125,7 @@ impl Test {
                 "POST",
                 &format!("/api/uploads/{}/finalize", u["id"].as_str().unwrap()),
                 c,
-                json!({"entrypoint":"index.html"}),
+                json!({"entrypoint":"index.html","idempotency_key":uuid::Uuid::new_v4(),"mutation_actor":"auth:dev-owner"}),
             )
             .await;
         assert_eq!(s, 200, "{r}");
@@ -197,18 +201,23 @@ async fn publication_case(t: Test) {
         403
     );
     let endpoint = format!("/api/view/{cap}/threads");
+    let (_, identity, guest_cookie) = t
+        .req("POST", &format!("/api/view/{cap}/identity"), "", json!({}))
+        .await;
+    let guest_cookie = guest_cookie.unwrap();
+    let mutation_actor = identity["mutation_actor"].as_str().unwrap();
     assert_eq!(
         t.req(
             "POST",
             &endpoint,
-            "",
-            json!({"guest_name":" ","body":"Hello","revision":revision})
+            &guest_cookie,
+            json!({"guest_name":" ","body":"Hello","revision":revision,"idempotency_key":"bad-name","mutation_actor":mutation_actor})
         )
         .await
         .0,
         400
     );
-    let(s,thread,_)=t.req("POST",&endpoint,"",json!({"guest_name":"banana","body":"<script>alert(1)</script>","revision":revision,"anchor":{"kind":"text","path":"index.html","exact":"Hello review"}})).await;
+    let(s,thread,_)=t.req("POST",&endpoint,&guest_cookie,json!({"idempotency_key":"guest-thread","mutation_actor":mutation_actor,"guest_name":"banana","body":"<script>alert(1)</script>","revision":revision,"anchor":{"kind":"text","path":"index.html","exact":"Hello review"}})).await;
     assert_eq!(s, 200, "{thread}");
     assert_eq!(thread["comments"][0]["authenticated"], false);
     let resolve = format!(
@@ -336,4 +345,106 @@ async fn mcp_parity_and_unauthenticated_rejection() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn http_comment_ack_loss_actor_boundaries_and_restart() {
+    comment_retry_case(Test::new(true), false).await;
+}
+#[tokio::test]
+#[ignore = "requires real local Firestore emulator and fake GCS"]
+async fn firestore_http_comment_ack_loss_actor_boundaries_and_restart() {
+    comment_retry_case(Test::cloud(), true).await;
+}
+async fn comment_retry_case(mut t: Test, cloud: bool) {
+    let owner = t.login("owner").await;
+    let (share, revision) = t.publish(&owner, "link-only").await;
+    let cap = share["capability"].as_str().unwrap();
+    let identity_url = format!("/api/view/{cap}/identity");
+    // Dropping initialization acknowledgement is safe: no mutation has occurred.
+    let _lost_initialization = t.req("POST", &identity_url, "", json!({})).await;
+    let (_, identity, cookie) = t.req("POST", &identity_url, "", json!({})).await;
+    let cookie = cookie.unwrap();
+    let actor = identity["mutation_actor"].as_str().unwrap();
+    let url = format!("/api/view/{cap}/threads");
+    let request = json!({"mutation_actor":actor,"idempotency_key":"lost-thread-response","guest_name":"Same display name","body":"Only one original","revision":revision["revision_id"],"anchor":{"kind":"general"}});
+    assert_eq!(t.req("POST", &url, "", request.clone()).await.0, 409);
+    assert_eq!(
+        t.req("POST", &url, "artifact_guest=tampered", request.clone())
+            .await
+            .0,
+        409
+    );
+    let first = t.req("POST", &url, &cookie, request.clone()).await;
+    assert_eq!(first.0, 200, "{}", first.1);
+    // Simulate lost mutation acknowledgement by retrying without consuming its result.
+    let (a, b) = tokio::join!(
+        t.req("POST", &url, &cookie, request.clone()),
+        t.req("POST", &url, &cookie, request.clone())
+    );
+    assert_eq!(a.0, 200);
+    assert_eq!(a.1, first.1);
+    assert_eq!(b.1, first.1);
+    let mut changed = request.clone();
+    changed["body"] = json!("Changed body");
+    assert_eq!(t.req("POST", &url, &cookie, changed).await.0, 409);
+    let (_, other_identity, other_cookie) = t.req("POST", &identity_url, "", json!({})).await;
+    assert_ne!(identity["mutation_actor"], other_identity["mutation_actor"]);
+    assert_eq!(
+        t.req("POST", &url, &other_cookie.unwrap(), request.clone())
+            .await
+            .0,
+        409
+    );
+    let reply_url = format!("{}/{}/replies", url, first.1["id"].as_str().unwrap());
+    let reply = json!({"mutation_actor":actor,"idempotency_key":"lost-reply-response","guest_name":"Same display name","body":"Only one reply"});
+    let saved = t.req("POST", &reply_url, &cookie, reply.clone()).await;
+    assert_eq!(saved.0, 200, "{}", saved.1);
+    // A later mutation cannot change the original response returned by replay.
+    let later = json!({"mutation_actor":"auth:dev-owner","idempotency_key":"later-owner-reply","body":"Later reply"});
+    assert_eq!(t.req("POST", &reply_url, &owner, later).await.0, 200);
+    let config = Config {
+        dev: true,
+        origin: "http://127.0.0.1:4317".into(),
+        tenant: None,
+        client: None,
+        secret: None,
+        gated_tenant: None,
+        signing_key: Some(
+            "synthetic-http-retry-test-key-not-production-000000000000000000000000".into(),
+        ),
+    };
+    t.router = if cloud {
+        let fresh = Test::cloud();
+        fresh.router
+    } else {
+        server::router(
+            server::app(
+                &t._dir.path().join("test.sqlite"),
+                t._dir.path().join("stage"),
+                config,
+            )
+            .unwrap(),
+        )
+    };
+    assert_eq!(
+        t.req("POST", &reply_url, &cookie, reply.clone()).await.1,
+        saved.1
+    );
+    assert_eq!(
+        t.req("POST", &url, &cookie, request.clone()).await.1,
+        first.1
+    );
+    let list = t.req("GET", &url, &cookie, json!({})).await.1;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["comments"].as_array().unwrap().len(), 3);
+    let lifecycle = format!("/api/shares/{}/lifecycle", share["id"].as_str().unwrap());
+    assert_eq!(
+        t.req("POST", &lifecycle, &owner, json!({"action":"unpublish"}))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(t.req("POST", &reply_url, &cookie, reply).await.0, 404);
+    assert_eq!(t.req("POST", &url, &cookie, request).await.0, 404);
 }

@@ -13,5 +13,6 @@ COPY --from=builder /build/target/release/artifact-board /usr/local/bin/artifact
 USER 10001:10001
 ENV ARTIFACT_STORE=firestore
 ENV ARTIFACT_BUILD_MODE=container
+ENV ARTIFACT_NODE_BIN_DIR=/usr/local/bin
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/artifact-board"]

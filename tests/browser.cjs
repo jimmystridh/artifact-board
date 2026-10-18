@@ -25,7 +25,7 @@ async function publish(context, name, files, policy = 'link-only') {
  const share = await json(context, '/api/shares', 'POST', { title: name, kind: 'static', policy, idempotency_key: require('node:crypto').randomUUID() });
  const upload = await json(context, `/api/shares/${share.id}/uploads`, 'POST', {});
  await json(context, upload.upload_url, 'PUT', { files });
- const result = await json(context, `/api/uploads/${upload.id}/finalize`, 'POST', { entrypoint: 'index.html' });
+ const result = await json(context, `/api/uploads/${upload.id}/finalize`, 'POST', { entrypoint: 'index.html', idempotency_key: crypto.randomUUID(), mutation_actor: 'auth:dev-owner' });
  assert.equal(result.state, 'ready');
  return { share, result, url: result.viewer_url };
 }

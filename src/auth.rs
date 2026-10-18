@@ -80,6 +80,12 @@ struct SessionClaim {
     aud: String,
 }
 #[derive(Serialize, Deserialize)]
+struct GuestClaim {
+    id: String,
+    exp: u64,
+    aud: String,
+}
+#[derive(Serialize, Deserialize)]
 struct FrameClaim {
     cap: String,
     revision: String,
@@ -147,6 +153,81 @@ impl Auth {
                             && self.config.gated_tenant == self.config.tenant))
             })
             .map(|s| s.principal)
+    }
+    fn retry_identity_configured(&self) -> Result<(), AppError> {
+        if !self.config.dev
+            && !self
+                .config
+                .signing_key
+                .as_ref()
+                .is_some_and(|key| key.len() >= 64)
+        {
+            return Err(error(
+                503,
+                "retry_identity_unavailable",
+                "A shared signing key is required for durable guest retry identity.",
+            ));
+        }
+        Ok(())
+    }
+    /// Pseudonymous retry identity only: never grants viewer or management access.
+    pub fn mutation_actor(
+        &self,
+        headers: &HeaderMap,
+        p: Option<&Principal>,
+    ) -> Result<String, AppError> {
+        self.retry_identity_configured()?;
+        if let Some(p) = p {
+            return Ok(format!("auth:{}", p.id));
+        }
+        let claim: GuestClaim = cookie(headers, "artifact_guest")
+            .and_then(|value| self.decode(&value, "artifact-guest-retry"))
+            .ok_or_else(|| error(409, "guest_identity_required", "Initialize guest identity before creating a mutation request. Retain the original identity for retries."))?;
+        if claim.id.len() != 64 || !claim.id.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(error(
+                409,
+                "guest_identity_required",
+                "Invalid guest retry identity.",
+            ));
+        }
+        Ok(format!("guest:{}", claim.id))
+    }
+    pub fn initialize_mutation_actor(
+        &self,
+        headers: &HeaderMap,
+        p: Option<&Principal>,
+    ) -> Result<(String, Option<String>), AppError> {
+        self.retry_identity_configured()?;
+        if let Ok(actor) = self.mutation_actor(headers, p) {
+            return Ok((actor, None));
+        }
+        let id = token();
+        let signed = self.sign(&GuestClaim {
+            id: id.clone(),
+            exp: now() + 30 * 86400,
+            aud: "artifact-guest-retry".into(),
+        });
+        let cookie = format!(
+            "artifact_guest={signed}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000{}",
+            if self.config.dev { "" } else { "; Secure" }
+        );
+        Ok((format!("guest:{id}"), Some(cookie)))
+    }
+    pub fn check_mutation_actor(
+        &self,
+        headers: &HeaderMap,
+        p: Option<&Principal>,
+        expected: &str,
+    ) -> Result<String, AppError> {
+        let actual = self.mutation_actor(headers, p)?;
+        if actual != expected {
+            return Err(error(
+                409,
+                "actor_changed",
+                "The request belongs to a different reviewer identity. Restore its original session before retrying.",
+            ));
+        }
+        Ok(actual)
     }
     pub fn frame_ticket(&self, cap: &str, revision: &str) -> String {
         self.sign(&FrameClaim {
@@ -514,6 +595,63 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("cookie", value.split(';').next().unwrap().parse().unwrap());
         h
+    }
+    #[test]
+    fn guest_retry_identity_initializes_before_mutation_and_survives_restart() {
+        let a = Auth::new(config());
+        let empty = HeaderMap::new();
+        assert_eq!(
+            a.mutation_actor(&empty, None).unwrap_err().code,
+            "guest_identity_required"
+        );
+        let (actor, cookie) = a.initialize_mutation_actor(&empty, None).unwrap();
+        let cookie = cookie.unwrap();
+        assert!(cookie.contains("HttpOnly; SameSite=Lax"));
+        let h = headers(&cookie);
+        let b = Auth::new(config());
+        assert_eq!(b.mutation_actor(&h, None).unwrap(), actor);
+        assert!(b.initialize_mutation_actor(&h, None).unwrap().1.is_none());
+        assert!(
+            b.check_mutation_actor(&h, None, "guest:someone-else")
+                .is_err()
+        );
+        let mut tampered = h.clone();
+        tampered.insert(
+            "cookie",
+            "artifact_guest=invalid.signature".parse().unwrap(),
+        );
+        assert!(b.mutation_actor(&tampered, None).is_err());
+        let expired = a.sign(&GuestClaim {
+            id: token(),
+            exp: now() - 1,
+            aud: "artifact-guest-retry".into(),
+        });
+        assert!(
+            b.mutation_actor(&headers(&format!("artifact_guest={expired}")), None)
+                .is_err()
+        );
+
+        assert!(
+            b.mutation_actor(&headers(&b.dev_login("owner").unwrap()), None)
+                .is_err()
+        );
+        let (other, _) = b.initialize_mutation_actor(&empty, None).unwrap();
+        assert_ne!(actor, other);
+        let mut missing = config();
+        missing.dev = false;
+        missing.signing_key = None;
+        let missing = Auth::new(missing);
+        assert_eq!(
+            missing
+                .initialize_mutation_actor(&empty, None)
+                .unwrap_err()
+                .status,
+            503
+        );
+        assert_eq!(
+            missing.mutation_actor(&empty, None).unwrap_err().status,
+            503
+        );
     }
     #[test]
     fn signed_sessions_survive_instance_restart_without_sqlite() {

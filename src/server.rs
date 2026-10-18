@@ -76,6 +76,7 @@ pub fn router(state: Shared) -> Router {
             "/frame/{cap}/{revision}/{ticket}/{*path}",
             get(frame_content),
         )
+        .route("/api/view/{cap}/identity", post(guest_identity))
         .route("/api/view/{cap}/threads", get(threads).post(add_thread))
         .route("/api/view/{cap}/threads/{thread}/replies", post(reply))
         .route("/mcp", post(mcp))
@@ -128,7 +129,7 @@ async fn dashboard(State(s): State<Shared>, h: HeaderMap) -> Result<Response, Ap
     };
     let shares = s.core.list_shares(&p).await?;
     Ok(Html(ui::dashboard(
-        json!({"shares":normalize_shares(shares),"principal":p,"development":s.auth.config.dev}),
+        json!({"shares":normalize_shares(shares),"mutation_actor":format!("auth:{}",p.id),"principal":p,"development":s.auth.config.dev}),
     ))
     .into_response())
 }
@@ -271,11 +272,6 @@ async fn upload_status(
 ) -> Result<Json<Value>, AppError> {
     Ok(Json(s.core.get_upload(&s.auth.require(&h)?, &id).await?))
 }
-fn staging_path(s: &App, id: &str) -> Result<PathBuf, AppError> {
-    uuid::Uuid::parse_str(id)
-        .map_err(|_| error(400, "invalid_upload", "Invalid upload identifier."))?;
-    Ok(s.staging.join(format!("{id}.json")))
-}
 async fn upload(
     State(s): State<Shared>,
     h: HeaderMap,
@@ -323,30 +319,18 @@ async fn upload(
         }
         ingest::validate_files(files).map_err(|e| error(400, "invalid_manifest", &e))?
     };
-    match &s.core {
-        crate::store::Store::Local(_) => {
-            let path = staging_path(&s, &id)?;
-            let tmp = path.with_extension(format!("{}.tmp", crate::auth::token()));
-            std::fs::write(&tmp, serde_json::to_vec(&files).unwrap())
-                .map_err(|_| error(500, "storage_error", "Cannot stage upload."))?;
-            std::fs::rename(tmp, path)
-                .map_err(|_| error(500, "storage_error", "Cannot commit staged upload."))?;
-        }
-        crate::store::Store::Firestore(cloud) => {
-            cloud
-                .stage_upload(
-                    &p,
-                    &id,
-                    &files,
-                    files
-                        .keys()
-                        .next()
-                        .map(String::as_str)
-                        .unwrap_or("index.html"),
-                )
-                .await?;
-        }
-    }
+    s.core
+        .stage_upload(
+            &p,
+            &id,
+            &files,
+            files
+                .keys()
+                .next()
+                .map(String::as_str)
+                .unwrap_or("index.html"),
+        )
+        .await?;
     Ok(Json(
         json!({"id":id,"state":"uploaded","file_count":files.len()}),
     ))
@@ -361,87 +345,113 @@ async fn finalize(
     Ok(Json(finalize_inner(s, p, id, v).await?))
 }
 async fn finalize_inner(s: Shared, p: Principal, id: String, v: Value) -> Result<Value, AppError> {
-    let u = s.core.get_upload(&p, &id).await?;
-    let sid = required(&u, "share_id")?;
-    let share = s.core.get_share(&p, sid).await?;
-    if u["revision_id"].as_str().is_some() {
-        return Ok(
-            json!({"share":share,"revision_id":u["revision_id"],"viewer_url":format!("/s/{}",share["capability"].as_str().unwrap()),"state":"ready"}),
-        );
+    let key = required(&v, "idempotency_key")?;
+    crate::core::validate_finalize_key(key)?;
+    if required(&v, "mutation_actor")? != format!("auth:{}", p.id) {
+        return Err(error(
+            409,
+            "actor_changed",
+            "The publisher changed. Review this request before trying again.",
+        ));
     }
-    let files: BTreeMap<String, Vec<u8>> = match &s.core {
-        crate::store::Store::Local(_) => {
-            let bytes = std::fs::read(staging_path(&s, &id)?).map_err(|_| {
-                error(
-                    409,
-                    "incomplete_upload",
-                    "Upload files before finalization.",
-                )
-            })?;
-            let files: BTreeMap<String, Vec<u8>> = serde_json::from_slice(&bytes)
-                .map_err(|_| error(500, "storage_error", "Invalid staging record."))?;
-            files
-        }
-        crate::store::Store::Firestore(cloud) => cloud.staged_files(&p, &id).await?.0,
-    };
+    let u = s.core.get_upload(&p, &id).await?;
+    let share = s.core.get_share(&p, required(&u, "share_id")?).await?;
     let kind = required(&share, "kind")?.to_owned();
-    let entry = v["entrypoint"]
-        .as_str()
-        .unwrap_or(if kind == "markdown" {
-            "README.md"
-        } else {
-            "index.html"
-        })
-        .to_owned();
+    let entry = match v.get("entrypoint") {
+        None => {
+            if kind == "markdown" {
+                "README.md"
+            } else {
+                "index.html"
+            }
+        }
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| error(400, "invalid_entrypoint", "Entrypoint must be a string."))?,
+    }
+    .to_owned();
+    // This freezes the actual staged source and original lifecycle version durably.
+    // Retries validate their key/payload before any cached result is returned.
+    let reservation = s.core.begin_finalize(&p, &id, key, &entry).await?;
     if kind == "react"
         && let crate::store::Store::Firestore(cloud) = &s.core
     {
-        let job = crate::build_jobs::enqueue(cloud, &p, &id, &entry).await?;
-        let job_id = required(&job, "id")?;
+        let result = if reservation["result"].is_object() {
+            reservation["result"].clone()
+        } else {
+            crate::build_jobs::enqueue_finalized(cloud, &p, &id, &entry, key).await?
+        };
+        let job_id = required(&result, "job_id")?;
+        // Retrying acceptance also recovers a crash before dispatch; dispatch itself
+        // has a durable claim and never blindly repeats an ambiguous external call.
         if let Some(dispatcher) = job_dispatcher()? {
             let _ = crate::build_jobs::dispatch(cloud, job_id, &dispatcher).await?;
         }
-        let mut result = crate::build_jobs::status(cloud, &p, job_id).await?;
-        result["job_id"] = json!(job_id);
-        result["status_url"] = json!(format!("/api/build-jobs/{job_id}"));
-        if std::env::var("ARTIFACT_BUILD_JOB_NAME").is_err() {
-            result["operator_notice"] =
-                json!("Build queued durably. A configured Cloud Run Job dispatcher is required.");
-        }
         return Ok(result);
     }
-    let prepared = tokio::task::spawn_blocking(move || {
-        ingest::prepare_with_mode(
-            &kind,
-            files,
-            &entry,
-            &std::env::var("ARTIFACT_BUILD_MODE").unwrap_or_else(|_| "container".into()),
-        )
+    if reservation["result"].is_object() {
+        return Ok(reservation["result"].clone());
+    }
+    let claim = if let crate::store::Store::Local(local) = &s.core {
+        let attempt = local.claim_finalize(&p, &id, key)?;
+        if attempt["result"].is_object() {
+            return Ok(attempt["result"].clone());
+        }
+        Some(required(&attempt, "claim_id")?.to_owned())
+    } else {
+        None
+    };
+    let files = s.core.staged_files(&p, &id).await?.0;
+    let preparation = tokio::task::spawn_blocking(move || {
+        // Static/Markdown validation must not vary with an instance's optional
+        // source-build configuration; identical frozen input has one outcome.
+        let mode = if kind == "react" {
+            std::env::var("ARTIFACT_BUILD_MODE").unwrap_or_else(|_| "container".into())
+        } else {
+            "container".into()
+        };
+        ingest::prepare_with_mode(&kind, files, &entry, &mode)
     })
     .await
-    .map_err(|_| error(500, "preparation_failed", "Preparation worker stopped."))?
-    .map_err(|e| error(422, "preparation_failed", &e))?;
-    let mut out = match &s.core {
-        crate::store::Store::Local(local) => {
-            local.publish(&p, &id, &prepared.files, &prepared.entrypoint)?
-        }
-        crate::store::Store::Firestore(cloud) => {
-            cloud
-                .publish_at_version(
-                    &p,
-                    &id,
-                    &prepared.files,
-                    &prepared.entrypoint,
-                    share["version"].as_u64().unwrap_or(0),
-                )
-                .await?
+    .map_err(|_| error(500, "preparation_failed", "Preparation worker stopped."))?;
+    let prepared = match preparation {
+        Ok(prepared) => prepared,
+        Err(message) => {
+            let failure = if message == "A trusted-host build is already running; retry later" {
+                error(503, "build_busy", &message)
+            } else {
+                error(422, "preparation_failed", &message)
+            };
+            if let (crate::store::Store::Local(local), Some(claim)) = (&s.core, claim.as_deref()) {
+                return local.record_finalize_failure(&p, &id, key, claim, &failure);
+            }
+            return Err(failure);
         }
     };
-    out["warnings"] = json!(prepared.warnings);
-    out["state"] = json!("ready");
-    out["viewer_url"] = json!(format!("/s/{}", share["capability"].as_str().unwrap()));
-    Ok(out)
+    // Receipt, revision, placements and latest pointer commit atomically.
+    if let (crate::store::Store::Local(local), Some(claim)) = (&s.core, claim.as_deref()) {
+        return local.publish_claimed(
+            &p,
+            &id,
+            key,
+            claim,
+            &prepared.files,
+            &prepared.entrypoint,
+            &json!(prepared.warnings),
+        );
+    }
+    s.core
+        .publish_finalized(
+            &p,
+            &id,
+            key,
+            &prepared.files,
+            &prepared.entrypoint,
+            &json!(prepared.warnings),
+        )
+        .await
 }
+
 fn job_dispatcher() -> Result<Option<crate::build_jobs::CloudRunDispatcher>, AppError> {
     let Ok(job) = std::env::var("ARTIFACT_BUILD_JOB_NAME") else {
         return Ok(None);
@@ -535,7 +545,14 @@ async fn view(
     } else {
         false
     };
-    Ok(Html(ui::review(json!({"share":share,"revision":rev,"threads":s.core.threads(&cap,p.as_ref()).await?,"capability":cap,"content_url":content_url,"principal":p,"is_owner":owner,"development":s.auth.config.dev}))).into_response())
+    let (actor, cookie) = s.auth.initialize_mutation_actor(&h, p.as_ref())?;
+    let mut response = Html(ui::review(json!({"share":share,"revision":rev,"threads":s.core.threads(&cap,p.as_ref()).await?,"capability":cap,"content_url":content_url,"mutation_actor":actor,"principal":p,"is_owner":owner,"development":s.auth.config.dev}))).into_response();
+    if let Some(cookie) = cookie {
+        response
+            .headers_mut()
+            .insert(header::SET_COOKIE, cookie.parse().unwrap());
+    }
+    Ok(response)
 }
 async fn content(
     State(s): State<Shared>,
@@ -615,6 +632,22 @@ async fn threads(
     let p = viewer(&s, &h, &cap).await?;
     Ok(Json(s.core.threads(&cap, p.as_ref()).await?))
 }
+async fn guest_identity(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path(cap): Path<String>,
+) -> Result<Response, AppError> {
+    s.auth.mutation(&h)?;
+    let p = viewer(&s, &h, &cap).await?;
+    let (actor, cookie) = s.auth.initialize_mutation_actor(&h, p.as_ref())?;
+    let mut response = Json(json!({"mutation_actor":actor})).into_response();
+    if let Some(cookie) = cookie {
+        response
+            .headers_mut()
+            .insert(header::SET_COOKIE, cookie.parse().unwrap());
+    }
+    Ok(response)
+}
 async fn add_thread(
     State(s): State<Shared>,
     h: HeaderMap,
@@ -623,9 +656,12 @@ async fn add_thread(
 ) -> Result<Json<Value>, AppError> {
     s.auth.mutation(&h)?;
     let p = viewer(&s, &h, &cap).await?;
+    let actor = s
+        .auth
+        .check_mutation_actor(&h, p.as_ref(), required(&v, "mutation_actor")?)?;
     Ok(Json(
         s.core
-            .add_thread(
+            .add_thread_idempotent(
                 &cap,
                 p.as_ref(),
                 v["guest_name"].as_str(),
@@ -634,6 +670,8 @@ async fn add_thread(
                 v.get("anchor")
                     .cloned()
                     .unwrap_or(json!({"kind":"general"})),
+                required(&v, "idempotency_key")?,
+                &actor,
             )
             .await?,
     ))
@@ -646,14 +684,19 @@ async fn reply(
 ) -> Result<Json<Value>, AppError> {
     s.auth.mutation(&h)?;
     let p = viewer(&s, &h, &cap).await?;
+    let actor = s
+        .auth
+        .check_mutation_actor(&h, p.as_ref(), required(&v, "mutation_actor")?)?;
     Ok(Json(
         s.core
-            .reply(
+            .reply_idempotent(
                 &cap,
                 &id,
                 p.as_ref(),
                 v["guest_name"].as_str(),
                 required(&v, "body")?,
+                required(&v, "idempotency_key")?,
+                &actor,
             )
             .await?,
     ))
@@ -708,11 +751,29 @@ fn tool_schema(name: &str) -> Value {
         "get_share" | "create_upload" | "notification_status" => &["share_id"],
         "get_upload" => &["upload_id"],
         "get_build" => &["job_id"],
-        "finalize_upload" => &["upload_id", "entrypoint"],
+        "finalize_upload" => &[
+            "upload_id",
+            "entrypoint",
+            "idempotency_key",
+            "mutation_actor",
+        ],
         "lifecycle" => &["share_id", "action"],
         "list_threads" => &["capability"],
-        "add_thread" => &["capability", "revision", "body", "anchor"],
-        "reply" => &["capability", "thread_id", "body"],
+        "add_thread" => &[
+            "capability",
+            "revision",
+            "body",
+            "anchor",
+            "idempotency_key",
+            "mutation_actor",
+        ],
+        "reply" => &[
+            "capability",
+            "thread_id",
+            "body",
+            "idempotency_key",
+            "mutation_actor",
+        ],
         "resolve" => &["share_id", "thread_id", "resolved"],
         _ => &[],
     };
@@ -730,7 +791,7 @@ async fn mcp(
     let method = v["method"].as_str().unwrap_or("");
     let result = match method {
         "initialize" => Ok(
-            json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"artifact-board","version":"0.1.0"}}),
+            json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"artifact-board","version":"0.1.0"},"_meta":{"mutation_actor":format!("auth:{}",p.id)}}),
         ),
         "tools/list" => Ok(
             json!({"tools":TOOLS.iter().map(|(name,description)|json!({"name":name,"description":description,"inputSchema":tool_schema(name)})).collect::<Vec<_>>()}),
@@ -790,8 +851,13 @@ async fn mcp(
                     "add_thread" => {
                         let cap = required(a, "capability")?;
                         let vp = viewer(&s, &h, cap).await?;
+                        let actor = s.auth.check_mutation_actor(
+                            &h,
+                            vp.as_ref(),
+                            required(a, "mutation_actor")?,
+                        )?;
                         s.core
-                            .add_thread(
+                            .add_thread_idempotent(
                                 cap,
                                 vp.as_ref(),
                                 None,
@@ -800,19 +866,28 @@ async fn mcp(
                                 a.get("anchor")
                                     .cloned()
                                     .unwrap_or(json!({"kind":"general"})),
+                                required(a, "idempotency_key")?,
+                                &actor,
                             )
                             .await
                     }
                     "reply" => {
                         let cap = required(a, "capability")?;
                         let vp = viewer(&s, &h, cap).await?;
+                        let actor = s.auth.check_mutation_actor(
+                            &h,
+                            vp.as_ref(),
+                            required(a, "mutation_actor")?,
+                        )?;
                         s.core
-                            .reply(
+                            .reply_idempotent(
                                 cap,
                                 required(a, "thread_id")?,
                                 vp.as_ref(),
                                 None,
                                 required(a, "body")?,
+                                required(a, "idempotency_key")?,
+                                &actor,
                             )
                             .await
                     }

@@ -73,4 +73,20 @@ Revalidated locally: the full 68-execution Rust aggregate with all ignored tests
 
 Follow-up JavaScript result: **19 passed, 0 failed** (7 reply/draft/race acceptance regressions, 7 annotation bridge tests, 5 build-state tests). These do not close rendered-browser or live-integration gaps.
 
-Remaining interrupted-request limitation: a lost mutation acknowledgement (rather than a successful POST followed by failed refresh) is still ambiguous. In particular, manually retrying after a lost upload-finalize or comment/reply POST response may create another operation. End-to-end request recovery/idempotency for those UI paths is not claimed by this patch; inspect current state before retrying.
+The initial acceptance-hardening checkpoint still had a lost-mutation-acknowledgement gap. The subsequent request-recovery checkpoint below supersedes that limitation for keyed comment/reply creation and upload finalization.
+
+## Durable request-recovery checkpoint (18 October 2026)
+
+Implemented actor/share/request-bound durable receipts for comment/reply creation and upload finalization, signed guest initialization before mutation, exact client acknowledgements and pending-request journals. Local preparations use durable expiring ownership claims; Firestore uses transactional receipts and stable build-job acceptance. See [REQUEST-RECOVERY.md](REQUEST-RECOVERY.md) for protocol, retention, expiry and client obligations.
+
+Passed locally against this checkpoint:
+- Full Rust aggregate: **91 passed, 0 failed, 0 ignored**, including official Firestore emulator transaction tests, fake GCS and fake Cloud Run dispatch contracts, and authored trusted-host React builds.
+- JavaScript: **51 passed, 0 failed**. Includes lost/truncated responses, concurrency, reloads, actor changes, altered payloads, stale/malformed receipts, response aliases and pending-job recovery. These are simulated DOM/source tests.
+- Real loopback HTTP smoke: authored full React source install/build/publication, exact finalization retry after an actual server-process restart, SSR shell/content responses, scoped CORS, and failed replacement preserving the live revision.
+- Strict Clippy across all targets, formatting, JavaScript/Python syntax and whitespace checks.
+
+Service regressions cover exact original receipts after later replies/revisions, independent concurrent clients, reconstructed stores, actual inserted comment identifiers, cookie tampering/expiry, cross-actor/share isolation, access revocation, source freezing, lifecycle fences, bounded receipt rollback, durable notification effects without duplication, lease expiry/reclaim and stale completion/failure rejection. In-process HTTP tests deliberately discard mutation responses to model a lost acknowledgement; they do not inject real network packet loss.
+
+An initial aggregate exposed Firestore contention beyond the earlier retry budget; bounded jittered retries fixed it and the complete aggregate passed afterward. Review also found unsafe busy-build rejection and malformed terminal acknowledgements; regression coverage now protects both. No known failing check remains at this local checkpoint.
+
+CI is expanded to the same emulator/owned-React aggregate and process-restart HTTP smoke, with a checksum-pinned official emulator and Java 21. Its result must be checked for the published commit separately. Browser acceptance remains skipped at the user's direction. Real Entra, Slack delivery, GCS, Cloud Run/IAM, container deployment, and production operations remain unrun. Persisting notification effects once does not promise exactly-once external Slack delivery.

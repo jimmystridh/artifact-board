@@ -209,6 +209,29 @@ pub async fn enqueue(
     upload_id: &str,
     entrypoint: &str,
 ) -> Result<Value, AppError> {
+    enqueue_inner(core, principal, upload_id, entrypoint, None).await
+}
+
+/// Freeze acceptance and its original receipt atomically with the durable job.
+pub async fn enqueue_finalized(
+    core: &FirestoreCore,
+    principal: &Principal,
+    upload_id: &str,
+    entrypoint: &str,
+    key: &str,
+) -> Result<Value, AppError> {
+    crate::core::validate_finalize_key(key)?;
+    let key = crate::firestore_core::finalize_key(principal, key);
+    enqueue_inner(core, principal, upload_id, entrypoint, Some(&key)).await
+}
+
+async fn enqueue_inner(
+    core: &FirestoreCore,
+    principal: &Principal,
+    upload_id: &str,
+    entrypoint: &str,
+    finalized_key: Option<&str>,
+) -> Result<Value, AppError> {
     if !valid_entry(entrypoint) {
         return Err(failure(
             400,
@@ -220,34 +243,46 @@ pub async fn enqueue(
     let share_id = upload["share_id"]
         .as_str()
         .ok_or_else(|| failure(500, "invalid_upload", "Upload share missing"))?;
-    core.get_share(principal, share_id).await?;
     let job_id = format!("build-{upload_id}");
     let token = core.store.runtime_token().await?;
     for _ in 0..4 {
         let transaction = core.store.begin_transaction(&token).await?;
         let result: Result<Value,AppError> = async {
+            let u=core.store.get(C::Uploads,upload_id,Some(&transaction),&token).await?.ok_or_else(||failure(404,"upload_not_found","Upload not found"))?;
+            let s=core.store.get(C::Shares,share_id,Some(&transaction),&token).await?.ok_or_else(||failure(404,"share_not_found","Share not found"))?;
+            if !principal.authenticated || s.data["owner_id"]!=principal.id || u.data["share_id"]!=share_id { return Err(failure(403,"forbidden","Publisher does not own this upload")); }
+            if s.data["kind"]!="react" { return Err(failure(400,"wrong_build_kind","Durable source builds require React source")); }
+            if matches!(s.data["state"].as_str(),Some("deleted"|"archived")) { return Err(failure(409,"state_conflict","Restore share before building")); }
+            let frozen=&u.data["finalization"];
+            if let Some(key)=finalized_key {
+                if frozen["key"]!=key || frozen["entrypoint"]!=entrypoint { return Err(failure(409,"idempotency_conflict","Upload finalization does not match its request")); }
+                if frozen["result"].is_object() { return Ok(frozen["result"].clone()); }
+                if frozen["expected_share_version"]!=s.data["version"] || frozen["expected_latest_revision"]!=s.data["latest_revision"] { return Err(failure(409,"stale_build","Share changed after finalization began")); }
+            } else if frozen.is_object() { return Err(failure(409,"upload_frozen","Upload belongs to its finalization request")); }
             let old=core.store.get(C::BuildJobs,&job_id,Some(&transaction),&token).await?;
             if let Some(old)=old {
                 if old.data["owner_id"]!=principal.id { return Err(failure(403,"forbidden","Build belongs to another publisher")); }
                 if old.data["entrypoint"]!=entrypoint { return Err(failure(409,"build_already_queued","This upload already has a build with a different entrypoint")); }
                 return Ok(visible(old.data));
             }
-            let u=core.store.get(C::Uploads,upload_id,Some(&transaction),&token).await?.ok_or_else(||failure(404,"upload_not_found","Upload not found"))?;
-            let s=core.store.get(C::Shares,share_id,Some(&transaction),&token).await?.ok_or_else(||failure(404,"share_not_found","Share not found"))?;
-            if !principal.authenticated || s.data["owner_id"]!=principal.id || u.data["share_id"]!=share_id { return Err(failure(403,"forbidden","Publisher does not own this upload")); }
-            if s.data["kind"]!="react" { return Err(failure(400,"wrong_build_kind","Durable source builds require React source")); }
-            if matches!(s.data["state"].as_str(),Some("deleted"|"archived")) { return Err(failure(409,"state_conflict","Restore share before building")); }
             if u.data["expires_at"].as_i64().unwrap_or(0)<timestamp() { return Err(failure(410,"expired_upload","Upload session expired")); }
             if u.data["revision_id"].is_string() { return Err(failure(409,"already_published","Upload has already been published")); }
             if !u.data["staged"].as_array().is_some_and(|a| !a.is_empty()) { return Err(failure(409,"upload_not_staged","Upload files before queuing build")); }
             let digest=format!("{:x}",Sha256::digest(serde_json::to_vec(&u.data["staged"]).unwrap()));
+            if finalized_key.is_some() && frozen["source_manifest_sha256"]!=digest { return Err(failure(409,"source_changed","Frozen upload source changed")); }
             let job=json!({"id":job_id,"owner_id":principal.id,"share_id":share_id,"upload_id":upload_id,"entrypoint":entrypoint,"state":"queued","attempt":0,"created_at":timestamp(),"updated_at":timestamp(),"expected_latest_revision":s.data["latest_revision"],"expected_share_version":s.data["version"],"source_manifest_sha256":digest,"lease_expires_at":null,"result":null,"error":null});
-            let mut frozen=u.data.clone(); frozen["build_job_id"]=json!(job_id);
+            let mut upload_next=u.data.clone(); upload_next["build_job_id"]=json!(job_id);
+            let result=if finalized_key.is_some() {
+                let mut receipt=json!({"share_id":share_id,"state":"queued","job_id":job_id,"status_url":format!("/api/build-jobs/{job_id}")});
+                if std::env::var("ARTIFACT_BUILD_JOB_NAME").is_err() { receipt["operator_notice"]=json!("Build queued durably. A configured Cloud Run Job dispatcher is required."); }
+                upload_next["finalization"]["result"]=receipt.clone();
+                receipt
+            } else { visible(job.clone()) };
             core.store.commit(&[
-                Mutation{collection:C::BuildJobs,id:job_id.clone(),data:job.clone(),condition:Precondition::Create},
-                Mutation{collection:C::Uploads,id:upload_id.into(),data:frozen,condition:Precondition::UpdateTime(u.update_time)},
+                Mutation{collection:C::BuildJobs,id:job_id.clone(),data:job,condition:Precondition::Create},
+                Mutation{collection:C::Uploads,id:upload_id.into(),data:upload_next,condition:Precondition::UpdateTime(u.update_time)},
             ],Some(&transaction),&token).await?;
-            Ok(visible(job))
+            Ok(result)
         }.await;
         let _ = core.store.rollback(&transaction, &token).await;
         match result {
@@ -441,7 +476,15 @@ pub async fn dispatch(
     next["dispatch_claim"] = json!(uuid::Uuid::new_v4().to_string());
     next["updated_at"] = json!(timestamp());
     next["dispatch_deadline"] = json!(timestamp() + 180);
-    save(core, job_id, &old, next, &token).await?;
+    match save(core, job_id, &old, next, &token).await {
+        Ok(()) => {}
+        // Another retry already claimed dispatch. Observe its durable state;
+        // the losing caller must neither launch again nor fail acceptance.
+        Err(e) if e.code == "storage_conflict" => {
+            return Ok(visible(load(core, job_id, &token).await?.data));
+        }
+        Err(e) => return Err(e),
+    }
     let outcome = dispatcher.run(job_id, &token).await;
     for _ in 0..4 {
         let old = load(core, job_id, &token).await?;

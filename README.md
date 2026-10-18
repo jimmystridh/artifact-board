@@ -77,4 +77,8 @@ The browser boundary requires actual browser verification before release. Untrus
 
 ## Continuous integration
 
-The source-checks workflow runs locked Rust tests, strict Clippy, formatting and all Node behavior regressions on pushes to main and pull requests, with read-only repository permissions and commit-pinned official GitHub actions. It does not execute the explicitly ignored emulator/React integration fixtures, browser acceptance, or live service tests; a green source-checks run is not full product acceptance.
+The source-checks workflow runs locked Rust tests, strict Clippy, formatting and all Node behavior regressions on pushes to main and pull requests, with read-only repository permissions and commit-pinned official GitHub actions. It also runs the pinned official Firestore emulator, synthetic GCS/Cloud Run transports, authored React source builds and real loopback HTTP publishing. Browser acceptance and live service integrations remain excluded; a green run is not full product acceptance.
+
+## Recovering interrupted writes
+
+Comment/reply creation and upload finalization require a stable `idempotency_key` plus expected `mutation_actor`. Preserve the exact request before sending and replay it after a lost acknowledgement. Guest retry identity is established before mutations; it never replaces the required unverified guest name or authorizes viewing. See [request recovery contract](docs/REQUEST-RECOVERY.md) for initialization, retention, identity-change handling and limits.

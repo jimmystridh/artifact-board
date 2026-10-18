@@ -1,7 +1,10 @@
 //! Firestore domain service. Blob generations live in private GCS; all domain writes
 //! use serializable Firestore transactions and bounded conflict retries.
 use crate::cloud_store::{BlobRef, CloudStore, Collection as C, Document, Mutation, Precondition};
-use crate::core::{AppError, Principal, validate_files};
+use crate::core::{
+    AppError, Principal, comment_fingerprint, comment_mutation, comment_response_json,
+    replay_comment_response, validate_comment_idempotency, validate_files,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -137,12 +140,83 @@ impl Tx {
             condition: Precondition::UpdateTime(old.update_time.clone()),
         });
     }
+    async fn replay_comment(
+        &self,
+        sid: &str,
+        operation: &str,
+        receipt: Option<(&str, &str)>,
+        fingerprint: &str,
+    ) -> Result<Option<Value>, AppError> {
+        let Some((key, scope)) = receipt else {
+            return Ok(None);
+        };
+        let receipt_id = comment_receipt_id(sid, scope, operation, key);
+        let Some(old) = self.maybe(C::Idempotency, &receipt_id).await? else {
+            return Ok(None);
+        };
+        replay_comment_response(
+            fingerprint,
+            old.data["fingerprint"].as_str().unwrap_or(""),
+            old.data["response_json"].as_str().unwrap_or(""),
+        )
+        .map(Some)
+    }
+    fn save_comment_receipt(
+        &mut self,
+        sid: &str,
+        operation: &str,
+        receipt: Option<(&str, &str)>,
+        fingerprint: &str,
+        response: &Value,
+    ) -> Result<(), AppError> {
+        if let Some((key, scope)) = receipt {
+            let encoded = comment_response_json(response)?;
+            let receipt_id = comment_receipt_id(sid, scope, operation, key);
+            self.create(
+                C::Idempotency,
+                &receipt_id,
+                json!({
+                    "kind": "comment", "share_id": sid, "operation": operation,
+                    "fingerprint": fingerprint, "response_json": encoded, "created_at": now(),
+                }),
+            );
+        }
+        Ok(())
+    }
+    async fn thread_snapshot(&self, mut thread: Value) -> Result<Value, AppError> {
+        let mut comments = self
+            .query(C::Comments, "thread_id", &thread["id"])
+            .await?
+            .into_iter()
+            .map(|d| d.data)
+            .collect::<Vec<_>>();
+        comments.sort_by_key(|c| {
+            (
+                c["sequence"].as_i64().unwrap_or(0),
+                c["id"].as_str().unwrap_or("").to_owned(),
+            )
+        });
+        thread["comments"] = json!(comments.into_iter().map(comment_output).collect::<Vec<_>>());
+        thread["placements"] = json!(
+            self.query(C::Placements, "thread_id", &thread["id"])
+                .await?
+                .into_iter()
+                .map(|mut d| {
+                    d.data.as_object_mut().unwrap().remove("thread_id");
+                    d.data
+                })
+                .collect::<Vec<_>>()
+        );
+        thread.as_object_mut().unwrap().remove("comment_count");
+        Ok(thread)
+    }
     async fn principal(&mut self, p: &Principal) -> Result<(), AppError> {
         auth(p)?;
         let key = hash(&p.id);
         let v = json!({"id":p.id,"display_name":p.display_name,"verified_email":p.verified_email});
         match self.maybe(C::Principals, &key).await? {
-            Some(d) => self.update(C::Principals, &key, &d, v),
+            Some(d) if d.data != v => self.update(C::Principals, &key, &d, v),
+            Some(_) => {}
             None => self.create(C::Principals, &key, v),
         };
         Ok(())
@@ -181,7 +255,8 @@ impl FirestoreCore {
         F: Fn(Tx) -> Fut,
         Fut: Future<Output = Result<(Tx, Value), AppError>>,
     {
-        for attempt in 0..5 {
+        const MAX_ATTEMPTS: usize = 8;
+        for attempt in 0..MAX_ATTEMPTS {
             let token = self.store.runtime_token().await?;
             let transaction = self.store.begin_transaction(&token).await?;
             let tx = Tx {
@@ -205,7 +280,7 @@ impl FirestoreCore {
                         Ok(_) => return Ok(value),
                         Err(e) => {
                             let _ = self.store.rollback(&transaction, &token).await;
-                            if e.code != "storage_conflict" || attempt == 4 {
+                            if e.code != "storage_conflict" || attempt + 1 == MAX_ATTEMPTS {
                                 return Err(e);
                             }
                         }
@@ -213,12 +288,17 @@ impl FirestoreCore {
                 }
                 Err(e) => {
                     let _ = self.store.rollback(&transaction, &token).await;
-                    if e.code != "storage_conflict" || attempt == 4 {
+                    if e.code != "storage_conflict" || attempt + 1 == MAX_ATTEMPTS {
                         return Err(e);
                     }
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20 * (1 << attempt))).await;
+            // Pessimistic read-to-write conflicts can abort both contenders together.
+            // Deterministic delays make them collide again in lockstep; jitter separates
+            // their next read snapshots while retaining a bounded retry budget.
+            let backoff_ms = (25_u64 << attempt).min(1000);
+            let delay_ms = rand::random_range(backoff_ms..=backoff_ms * 2);
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
         Err(err(
             409,
@@ -380,6 +460,13 @@ impl FirestoreCore {
                 "Upload is frozen for its queued build",
             ));
         }
+        if u["finalization"].is_object() {
+            return Err(err(
+                409,
+                "upload_frozen",
+                "Upload is frozen for its finalization request",
+            ));
+        }
         let manifest = self.blob_manifest(uid, files).await?;
         self.transact(|mut tx| {
             let manifest = manifest.clone();
@@ -403,6 +490,13 @@ impl FirestoreCore {
                         "Upload is frozen for its queued build",
                     ));
                 }
+                if u.data["finalization"].is_object() {
+                    return Err(err(
+                        409,
+                        "upload_frozen",
+                        "Upload is frozen for its finalization request",
+                    ));
+                }
                 let mut v = u.data.clone();
                 v["staged"] = manifest;
                 v["entrypoint"] = json!(entrypoint);
@@ -423,6 +517,47 @@ impl FirestoreCore {
             self.read_manifest(&u["staged"]).await?,
             u["entrypoint"].as_str().unwrap_or("index.html").into(),
         ))
+    }
+    /// Reserve the exact upload source and request before any preparation can run.
+    /// The global key reference and upload freeze commit together, including on retries.
+    pub async fn begin_finalize(
+        &self,
+        p: &Principal,
+        uid: &str,
+        key: &str,
+        entrypoint: &str,
+    ) -> Result<Value, AppError> {
+        crate::core::validate_finalize_key(key)?;
+        let ikey = finalize_key(p, key);
+        let payload = json!({"upload_id":uid,"entrypoint":entrypoint});
+        self.transact(|mut tx| {
+            let ikey=ikey.clone(); let payload=payload.clone();
+            async move {
+                let u=tx.get(C::Uploads,uid).await?;
+                let sid=u.data["share_id"].as_str().unwrap();
+                let s=tx.get(C::Shares,sid).await?;
+                owner(p,&s.data)?; writable(&s.data)?;
+                let old=tx.maybe(C::Idempotency,&ikey).await?;
+                if let Some(old)=old {
+                    if old.data["payload"]!=payload || old.data["owner_id"]!=p.id { return Err(err(409,"idempotency_conflict","Finalization key already binds different input")); }
+                    let frozen=&u.data["finalization"];
+                    if frozen["key"]!=ikey || frozen["payload"]!=payload { return Err(err(409,"idempotency_conflict","Upload finalization does not match its request")); }
+                    if frozen["result"].is_null() && frozen["expected_share_version"]!=s.data["version"] { return Err(err(409,"stale_build","Share changed after finalization began")); }
+                    return Ok((tx,frozen.clone()));
+                }
+                if u.data["finalization"].is_object() { return Err(err(409,"idempotency_conflict","Upload already binds another finalization key")); }
+                if u.data["revision_id"].is_string() { return Err(err(409,"already_finalized","Upload was already finalized")); }
+                if u.data["build_job_id"].is_string() { return Err(err(409,"upload_frozen","Upload already belongs to a build")); }
+                if u.data["expires_at"].as_i64().unwrap_or(0)<now() { return Err(err(410,"expired_upload","Upload session expired")); }
+                if !u.data["staged"].as_array().is_some_and(|v|!v.is_empty()) { return Err(err(409,"incomplete_upload","Upload files before finalization")); }
+                let digest=format!("{:x}",Sha256::digest(serde_json::to_vec(&u.data["staged"]).unwrap()));
+                let frozen=json!({"key":ikey,"payload":payload,"entrypoint":entrypoint,"source_manifest_sha256":digest,"expected_share_version":s.data["version"],"expected_latest_revision":s.data["latest_revision"],"result":null});
+                let mut next=u.data.clone(); next["finalization"]=frozen.clone();
+                tx.create(C::Idempotency,&ikey,json!({"operation":"finalize","owner_id":p.id,"payload":payload,"upload_id":uid}));
+                tx.update(C::Uploads,uid,&u,next);
+                Ok((tx,frozen))
+            }
+        }).await
     }
     async fn read_manifest(&self, manifest: &Value) -> Result<BTreeMap<String, Vec<u8>>, AppError> {
         let rows = manifest.as_array().ok_or_else(|| {
@@ -463,8 +598,32 @@ impl FirestoreCore {
         files: &BTreeMap<String, Vec<u8>>,
         entrypoint: &str,
     ) -> Result<Value, AppError> {
-        self.publish_inner(p, uid, files, entrypoint, None, None, None)
+        self.publish_inner(p, uid, files, entrypoint, None, None, None, None)
             .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_finalized(
+        &self,
+        p: &Principal,
+        uid: &str,
+        key: &str,
+        files: &BTreeMap<String, Vec<u8>>,
+        entrypoint: &str,
+        warnings: &Value,
+    ) -> Result<Value, AppError> {
+        crate::core::validate_finalize_key(key)?;
+        let ikey = finalize_key(p, key);
+        self.publish_inner(
+            p,
+            uid,
+            files,
+            entrypoint,
+            None,
+            None,
+            None,
+            Some((&ikey, warnings)),
+        )
+        .await
     }
     pub async fn publish_expected(
         &self,
@@ -474,8 +633,17 @@ impl FirestoreCore {
         entrypoint: &str,
         expected_latest: Option<&str>,
     ) -> Result<Value, AppError> {
-        self.publish_inner(p, uid, files, entrypoint, Some(expected_latest), None, None)
-            .await
+        self.publish_inner(
+            p,
+            uid,
+            files,
+            entrypoint,
+            Some(expected_latest),
+            None,
+            None,
+            None,
+        )
+        .await
     }
     /// Atomically fence the worker lease and share lifecycle version, publish, and complete its job.
     pub async fn publish_for_job(
@@ -494,6 +662,7 @@ impl FirestoreCore {
             entrypoint,
             None,
             Some((job_id, claim_id)),
+            None,
             None,
         )
         .await
@@ -515,6 +684,7 @@ impl FirestoreCore {
             None,
             None,
             Some(expected_version),
+            None,
         )
         .await
     }
@@ -529,6 +699,7 @@ impl FirestoreCore {
         expected_latest: Option<Option<&str>>,
         job: Option<(&str, &str)>,
         expected_version: Option<u64>,
+        finalized: Option<(&str, &Value)>,
     ) -> Result<Value, AppError> {
         auth(p)?;
         let u = self.get_upload(p, uid).await?;
@@ -538,6 +709,29 @@ impl FirestoreCore {
                 .await?
                 .data,
         )?;
+        match (u["finalization"].is_object(), finalized, job) {
+            (true, Some((key, _)), None) if u["finalization"]["key"] == key => {
+                if u["finalization"]["result"].is_object() {
+                    return Ok(u["finalization"]["result"].clone());
+                }
+            }
+            (true, None, Some(_)) => {}
+            (true, _, _) => {
+                return Err(err(
+                    409,
+                    "upload_frozen",
+                    "Upload belongs to a different finalization request",
+                ));
+            }
+            (false, Some(_), _) => {
+                return Err(err(
+                    409,
+                    "finalization_required",
+                    "Reserve finalization before publication",
+                ));
+            }
+            _ => {}
+        }
         if job.is_none() && u["build_job_id"].is_string() {
             return Err(err(
                 409,
@@ -582,6 +776,14 @@ impl FirestoreCore {
                 let sid=u.data["share_id"].as_str().unwrap();
                 let s=tx.get(C::Shares,sid).await?;
                 owner(p,&s.data)?;writable(&s.data)?;
+                if let Some((key,_))=finalized {
+                    let frozen=&u.data["finalization"];
+                    if frozen["key"]!=key { return Err(err(409,"idempotency_conflict","Upload finalization key does not match")); }
+                    if frozen["result"].is_object() { return Ok((tx,frozen["result"].clone())); }
+                    if frozen["expected_share_version"]!=s.data["version"] { return Err(err(409,"stale_build","Share changed after finalization began")); }
+                    let digest=format!("{:x}",Sha256::digest(serde_json::to_vec(&u.data["staged"]).unwrap()));
+                    if frozen["source_manifest_sha256"]!=digest { return Err(err(409,"source_changed","Frozen upload source changed")); }
+                } else if job.is_none() && u.data["finalization"].is_object() { return Err(err(409,"upload_frozen","Upload belongs to its finalization request")); }
                 let job_doc=if let Some((jid,claim))=job{
                     let j=tx.get(C::BuildJobs,jid).await?;
                     if j.data["upload_id"]!=uid || j.data["share_id"]!=sid || u.data["build_job_id"]!=jid{return Err(err(409,"build_state_conflict","Build does not own this upload"));}
@@ -609,8 +811,13 @@ impl FirestoreCore {
                 tx.create(C::Revisions,&rid,r);
                 let mut next=s.data.clone();next["latest_revision"]=json!(rid);next["state"]=json!("published");next["version"]=json!(s.data["version"].as_u64().unwrap_or(0)+1);
                 tx.update(C::Shares,sid,&s,next.clone());
-                let mut uv=u.data.clone();uv["revision_id"]=json!(rid);tx.update(C::Uploads,uid,&u,uv);
                 let mut out=output(next,true);out["revision_id"]=json!(rid);
+                let mut uv=u.data.clone();uv["revision_id"]=json!(rid);
+                if let Some((_,warnings))=finalized {
+                    out=json!({"share_id":sid,"revision_id":rid,"viewer_url":format!("/s/{}",s.data["capability"].as_str().unwrap()),"state":"ready","warnings":warnings});
+                    uv["finalization"]["result"]=out.clone();
+                }
+                tx.update(C::Uploads,uid,&u,uv);
                 if let(Some((jid,_)),Some(j))=(job,job_doc){let mut done=j.data.clone();done["state"]=json!("succeeded");done["revision_id"]=json!(rid);done["result"]=out.clone();done["finished_at"]=json!(now());tx.update(C::BuildJobs,jid,&j,done);}
                 Ok((tx,out))
             }
@@ -718,19 +925,81 @@ impl FirestoreCore {
         revision: &str,
         anchor: Value,
     ) -> Result<Value, AppError> {
-        valid_body(body)?;
-        if !anchor.is_object() || anchor.to_string().len() > 16384 {
-            return Err(err(
-                400,
-                "invalid_anchor",
-                "Anchor must be a bounded JSON object",
-            ));
-        }
-        let a = actor(p, guest_name)?;
+        self.add_thread_inner(cap, p, guest_name, body, revision, anchor, None)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_thread_idempotent(
+        &self,
+        cap: &str,
+        p: Option<&Principal>,
+        guest_name: Option<&str>,
+        body: &str,
+        revision: &str,
+        anchor: Value,
+        key: &str,
+        actor_scope: &str,
+    ) -> Result<Value, AppError> {
+        validate_comment_idempotency(p, key, actor_scope)?;
+        self.add_thread_inner(
+            cap,
+            p,
+            guest_name,
+            body,
+            revision,
+            anchor,
+            Some((key, actor_scope)),
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn add_thread_inner(
+        &self,
+        cap: &str,
+        p: Option<&Principal>,
+        guest_name: Option<&str>,
+        body: &str,
+        revision: &str,
+        anchor: Value,
+        receipt: Option<(&str, &str)>,
+    ) -> Result<Value, AppError> {
+        let fingerprint = comment_fingerprint(&json!({
+            "guest_name": guest_name, "body": body, "revision": revision, "anchor": anchor,
+        }));
         let tid = id();
-        let mut out=self.transact(|mut tx|{let a=a.clone();let tid=tid.clone();let anchor=anchor.clone();async move{let s=tx.view(cap,p).await?;let r=tx.get(C::Revisions,revision).await?;if r.data["share_id"]!=s.data["id"]{return Err(err(400,"invalid_revision","Revision must belong to this share"));}let t=json!({"id":tid,"share_id":s.data["id"],"original_revision":revision,"original_anchor":anchor,"resolved":false,"created_at":now(),"comment_count":1});post(&mut tx,&s.data,&tid,&a,p,body,1).await?;tx.create(C::Threads,&tid,t.clone());Ok((tx,t))}}).await?;
-        self.hydrate(&mut out).await?;
-        Ok(out)
+        self.transact(|mut tx| {
+            let tid = tid.clone();
+            let anchor = anchor.clone();
+            let fingerprint = fingerprint.clone();
+            async move {
+                // The share state and admission check precede the receipt lookup on every retry.
+                let s = tx.view(cap, p).await?;
+                let sid = s.data["id"].as_str().unwrap();
+                if let Some(result) = tx.replay_comment(sid, "thread", receipt, &fingerprint).await? {
+                    return Ok((tx, result));
+                }
+                valid_body(body)?;
+                if !anchor.is_object() || anchor.to_string().len() > 16384 {
+                    return Err(err(400, "invalid_anchor", "Anchor must be a bounded JSON object"));
+                }
+                let a = actor(p, guest_name)?;
+                let r = tx.get(C::Revisions, revision).await?;
+                if r.data["share_id"] != s.data["id"] {
+                    return Err(err(400, "invalid_revision", "Revision must belong to this share"));
+                }
+                let t = json!({"id":tid,"share_id":sid,"original_revision":revision,
+                    "original_anchor":anchor,"resolved":false,"created_at":now(),"comment_count":1});
+                let comment = post(&mut tx, &s.data, &tid, &a, p, body, 1).await?;
+                tx.create(C::Threads, &tid, t.clone());
+                let mut result = t;
+                comment_mutation(&mut result, receipt, "thread", comment["id"].as_str().unwrap());
+                result.as_object_mut().unwrap().remove("comment_count");
+                result["comments"] = json!([comment_output(comment)]);
+                result["placements"] = json!([]);
+                tx.save_comment_receipt(sid, "thread", receipt, &fingerprint, &result)?;
+                Ok((tx, result))
+            }
+        }).await
     }
     pub async fn reply(
         &self,
@@ -740,28 +1009,75 @@ impl FirestoreCore {
         guest_name: Option<&str>,
         body: &str,
     ) -> Result<Value, AppError> {
-        valid_body(body)?;
-        let a = actor(p, guest_name)?;
-        let mut out = self
-            .transact(|mut tx| {
-                let a = a.clone();
-                async move {
-                    let s = tx.view(cap, p).await?;
-                    let t = tx.get(C::Threads, tid).await?;
-                    if t.data["share_id"] != s.data["id"] {
-                        return Err(err(404, "not_found", "Thread not found"));
-                    }
-                    let seq = t.data["comment_count"].as_u64().unwrap_or(0) + 1;
-                    post(&mut tx, &s.data, tid, &a, p, body, seq).await?;
-                    let mut next = t.data.clone();
-                    next["comment_count"] = json!(seq);
-                    tx.update(C::Threads, tid, &t, next.clone());
-                    Ok((tx, next))
+        self.reply_inner(cap, tid, p, guest_name, body, None).await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reply_idempotent(
+        &self,
+        cap: &str,
+        tid: &str,
+        p: Option<&Principal>,
+        guest_name: Option<&str>,
+        body: &str,
+        key: &str,
+        actor_scope: &str,
+    ) -> Result<Value, AppError> {
+        validate_comment_idempotency(p, key, actor_scope)?;
+        self.reply_inner(cap, tid, p, guest_name, body, Some((key, actor_scope)))
+            .await
+    }
+    async fn reply_inner(
+        &self,
+        cap: &str,
+        tid: &str,
+        p: Option<&Principal>,
+        guest_name: Option<&str>,
+        body: &str,
+        receipt: Option<(&str, &str)>,
+    ) -> Result<Value, AppError> {
+        let fingerprint = comment_fingerprint(&json!({
+            "guest_name": guest_name, "body": body, "thread": tid,
+        }));
+        self.transact(|mut tx| {
+            let fingerprint = fingerprint.clone();
+            async move {
+                let s = tx.view(cap, p).await?;
+                let sid = s.data["id"].as_str().unwrap();
+                if let Some(result) = tx
+                    .replay_comment(sid, "reply", receipt, &fingerprint)
+                    .await?
+                {
+                    return Ok((tx, result));
                 }
-            })
-            .await?;
-        self.hydrate(&mut out).await?;
-        Ok(out)
+                valid_body(body)?;
+                let a = actor(p, guest_name)?;
+                let t = tx.get(C::Threads, tid).await?;
+                if t.data["share_id"] != s.data["id"] {
+                    return Err(err(404, "not_found", "Thread not found"));
+                }
+                // Firestore reads do not see buffered writes: hydrate the committed snapshot,
+                // then append this transaction's exact comment before storing the receipt.
+                let mut result = tx.thread_snapshot(t.data.clone()).await?;
+                let seq = t.data["comment_count"].as_u64().unwrap_or(0) + 1;
+                let comment = post(&mut tx, &s.data, tid, &a, p, body, seq).await?;
+                comment_mutation(
+                    &mut result,
+                    receipt,
+                    "reply",
+                    comment["id"].as_str().unwrap(),
+                );
+                result["comments"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(comment_output(comment));
+                let mut next = t.data.clone();
+                next["comment_count"] = json!(seq);
+                tx.update(C::Threads, tid, &t, next);
+                tx.save_comment_receipt(sid, "reply", receipt, &fingerprint, &result)?;
+                Ok((tx, result))
+            }
+        })
+        .await
     }
     pub async fn resolve(
         &self,
@@ -917,6 +1233,16 @@ impl FirestoreCore {
 fn revision_output(r: &Value) -> Value {
     json!({"id":r["id"],"entrypoint":r["entrypoint"],"digest":r["digest"],"created_at":r["created_at"]})
 }
+fn comment_receipt_id(sid: &str, scope: &str, operation: &str, key: &str) -> String {
+    // JSON tuple encoding prevents delimiter collisions between scope/key components.
+    hash(&json!(["comment-receipt-v1", sid, scope, operation, key]).to_string())
+}
+fn comment_output(mut comment: Value) -> Value {
+    for field in ["thread_id", "sequence"] {
+        comment.as_object_mut().unwrap().remove(field);
+    }
+    comment
+}
 async fn post(
     tx: &mut Tx,
     s: &Value,
@@ -925,7 +1251,7 @@ async fn post(
     p: Option<&Principal>,
     body: &str,
     sequence: u64,
-) -> Result<(), AppError> {
+) -> Result<Value, AppError> {
     let sid = s["id"].as_str().unwrap();
     let mut recipients = BTreeSet::new();
     recipients.insert(s["owner_id"].as_str().unwrap().to_owned());
@@ -956,7 +1282,8 @@ async fn post(
     }
     let cid = id();
     let eid = id();
-    tx.create(C::Comments,&cid,json!({"id":cid,"thread_id":tid,"actor_id":a.0,"display_name":a.1,"authenticated":a.2,"body":body,"created_at":now(),"sequence":sequence}));
+    let comment = json!({"id":cid,"thread_id":tid,"actor_id":a.0,"display_name":a.1,"authenticated":a.2,"body":body,"created_at":now(),"sequence":sequence});
+    tx.create(C::Comments, &cid, comment.clone());
     tx.create(C::Events,&eid,json!({"id":eid,"share_id":sid,"thread_id":tid,"actor_id":a.0,"kind":"comment","created_at":now()}));
     for recipient in recipients {
         let principal = tx.maybe(C::Principals, &hash(&recipient)).await?;
@@ -1009,7 +1336,7 @@ async fn post(
             json!({"batch_id":bid,"event_id":eid}),
         );
     }
-    Ok(())
+    Ok(comment)
 }
 fn normalize(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -1060,4 +1387,8 @@ fn rematch(anchor: &Value, files: &BTreeMap<String, Vec<u8>>) -> (&'static str, 
         }
     }
     ("unmatched", "No conservative match found")
+}
+
+pub(crate) fn finalize_key(p: &Principal, key: &str) -> String {
+    hash(&json!(["finalize-upload-v1", p.id, key]).to_string())
 }

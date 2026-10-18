@@ -16,7 +16,12 @@ def request(path,method='GET',data=None,expected=200):
 def publish(share,files,entry):
  u,_=request('/api/shares/'+share['id']+'/uploads','POST',{})
  request(u['upload_url'],'PUT',{'files':[{'path':p,'content_base64':base64.b64encode(b).decode()}for p,b in files.items()]})
- return request('/api/uploads/'+u['id']+'/finalize','POST',{'entrypoint':entry})[0]
+ payload={'entrypoint':entry,'idempotency_key':'http-finalize','mutation_actor':'auth:dev-owner'}
+ endpoint='/api/uploads/'+u['id']+'/finalize'
+ result=request(endpoint,'POST',payload)[0]
+ assert request(endpoint,'POST',payload)[0]==result,'Lost acknowledgement replay changed the receipt'
+ publish.last_request=(endpoint,payload,result)
+ return result
 with tempfile.TemporaryDirectory(prefix='artifact-http-') as data:
  env.update(ARTIFACT_BIND='127.0.0.1:4319',ARTIFACT_DATA_DIR=data,ARTIFACT_BUILD_MODE='trusted-host')
  app=subprocess.Popen([str(root/'target/debug/artifact-board'),'--dev-fixtures'],cwd=root,env=env)
@@ -35,9 +40,21 @@ with tempfile.TemporaryDirectory(prefix='artifact-http-') as data:
   if not path:path=re.search(r'src="(/frame/[^"]+)"',html)
   assert path,'SSR preview path missing'
   preview,h=request(path.group(1).replace('&amp;','&'));assert 'type="module"' in preview;assert h['Access-Control-Allow-Origin']=='null';assert 'allow-same-origin' not in h['Content-Security-Policy']
+  # Restart the actual owned process, reauthenticate the same publisher, and recover
+  # the original acknowledgement from durable local-reference state.
+  app.terminate();app.wait(timeout=10)
+  app=subprocess.Popen([str(root/'target/debug/artifact-board'),'--dev-fixtures'],cwd=root,env=env)
+  for i in range(100):
+   try:
+    with socket.create_connection(('127.0.0.1',4319),.1):break
+   except OSError:time.sleep(.1)
+  _,h=request('/dev/login','POST',{'identity':'owner'});cookie=h['Set-Cookie'].split(';')[0]
+  endpoint,payload,receipt=publish.last_request
+  assert request(endpoint,'POST',payload)[0]==receipt,'Restart replay changed original receipt'
+  recovered,_=request('/api/shares/'+share['id']);assert len(recovered['revisions'])==1
   # A failing replacement must preserve the currently published artifact.
   broken=dict(files);pkg=json.loads(broken['package.json']);pkg['scripts']['build']='node -e "process.exit(17)"';broken['package.json']=json.dumps(pkg).encode()
-  u,_=request('/api/shares/'+share['id']+'/uploads','POST',{});request(u['upload_url'],'PUT',{'files':[{'path':p,'content_base64':base64.b64encode(b).decode()}for p,b in broken.items()]});failure,_=request('/api/uploads/'+u['id']+'/finalize','POST',{'entrypoint':'package.json'},422);after,_=request('/api/shares/'+share['id']);assert after['latest_revision']==before['latest_revision']
-  print('PASS: real HTTP login, full React source upload/build/publication, SSR shell, scoped CORS preview, and failed replacement preserves live revision. Browser rendering remains unrun.')
+  u,_=request('/api/shares/'+share['id']+'/uploads','POST',{});request(u['upload_url'],'PUT',{'files':[{'path':p,'content_base64':base64.b64encode(b).decode()}for p,b in broken.items()]});failure,_=request('/api/uploads/'+u['id']+'/finalize','POST',{'entrypoint':'package.json','idempotency_key':'http-failed-finalize','mutation_actor':'auth:dev-owner'},422);after,_=request('/api/shares/'+share['id']);assert after['latest_revision']==before['latest_revision']
+  print('PASS: real HTTP login, full React source upload/build/publication, SSR shell, scoped CORS preview, exact finalize retry after actual process restart, and failed replacement preserves live revision. Browser rendering remains unrun.')
  finally:
   app.terminate();app.wait(timeout=10)

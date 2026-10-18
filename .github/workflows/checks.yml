@@ -11,7 +11,9 @@ concurrency:
 jobs:
   checks:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.1
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -34,3 +36,22 @@ jobs:
           node --check assets/app.js
           node --check assets/bridge.js
           python3 -m py_compile tests/run_http_smoke.py tests/run_firestore_contract.py
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install pinned official Firestore emulator
+        run: |
+          mkdir -p .local/firebase-home/.cache/firebase/emulators
+          curl --fail --silent --show-error --location --retry 2 \
+            https://storage.googleapis.com/firebase-preview-drop/emulator/cloud-firestore-emulator-v1.22.0.jar \
+            -o .local/firebase-home/.cache/firebase/emulators/cloud-firestore-emulator-v1.22.0.jar
+          echo "9b6498b7f62714d67f48f59b3818883cd682dbcd46b9f59511de81c97bb5166c  .local/firebase-home/.cache/firebase/emulators/cloud-firestore-emulator-v1.22.0.jar" | sha256sum --check
+      - name: Locate the operator-approved Node runtime
+        run: echo "ARTIFACT_NODE_BIN_DIR=$(dirname "$(command -v node)")" >> "$GITHUB_ENV"
+      - name: Real Firestore and owned React fixtures (fake GCS and Cloud Run)
+        run: |
+          cargo build --locked
+          python3 tests/run_firestore_contract.py -- -- --include-ignored
+      - name: Real HTTP React publication and failed replacement
+        run: python3 tests/run_http_smoke.py

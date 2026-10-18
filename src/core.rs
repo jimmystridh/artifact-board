@@ -3,7 +3,7 @@
 //! Local prototype policies: authenticated principals are transport-validated;
 //! archive/unpublish/delete deny all viewers, restore returns to unpublished.
 //! No permanent purge or production identity/tenant policy is implemented.
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -77,9 +77,14 @@ impl Core {
  CREATE TABLE IF NOT EXISTS principals(id TEXT PRIMARY KEY,name TEXT NOT NULL,email TEXT);
  CREATE TABLE IF NOT EXISTS shares(id TEXT PRIMARY KEY,owner TEXT NOT NULL,title TEXT NOT NULL,kind TEXT NOT NULL,policy TEXT NOT NULL,state TEXT NOT NULL,capability TEXT UNIQUE NOT NULL,latest TEXT,created INTEGER NOT NULL,idem TEXT NOT NULL,UNIQUE(owner,idem));
  CREATE TABLE IF NOT EXISTS uploads(id TEXT PRIMARY KEY,share TEXT NOT NULL REFERENCES shares(id),owner TEXT NOT NULL,token TEXT NOT NULL,expires INTEGER NOT NULL,revision TEXT);
+ CREATE TABLE IF NOT EXISTS upload_staging(upload TEXT PRIMARY KEY REFERENCES uploads(id),files BLOB NOT NULL);
+ CREATE TABLE IF NOT EXISTS finalize_requests(owner TEXT NOT NULL,key TEXT NOT NULL,upload TEXT UNIQUE NOT NULL REFERENCES uploads(id),entrypoint TEXT NOT NULL,source_digest TEXT NOT NULL,share_version INTEGER NOT NULL,result TEXT,PRIMARY KEY(owner,key));
+ CREATE TABLE IF NOT EXISTS finalize_attempts(upload TEXT PRIMARY KEY REFERENCES uploads(id),claim TEXT NOT NULL,lease_until INTEGER NOT NULL,error TEXT);
+ CREATE TABLE IF NOT EXISTS share_versions(share TEXT PRIMARY KEY REFERENCES shares(id),version INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS revisions(id TEXT PRIMARY KEY,share TEXT NOT NULL REFERENCES shares(id),entrypoint TEXT NOT NULL,digest TEXT NOT NULL,manifest TEXT NOT NULL,created INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS files(revision TEXT NOT NULL REFERENCES revisions(id),path TEXT NOT NULL,bytes BLOB NOT NULL,PRIMARY KEY(revision,path));
  CREATE TABLE IF NOT EXISTS threads(id TEXT PRIMARY KEY,share TEXT NOT NULL REFERENCES shares(id),revision TEXT NOT NULL REFERENCES revisions(id),anchor TEXT NOT NULL,resolved INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS comment_receipts(share TEXT NOT NULL REFERENCES shares(id),actor_scope TEXT NOT NULL,operation TEXT NOT NULL,request_key TEXT NOT NULL,fingerprint TEXT NOT NULL,response_json TEXT NOT NULL,created INTEGER NOT NULL,PRIMARY KEY(share,actor_scope,operation,request_key));
  CREATE TABLE IF NOT EXISTS comments(id TEXT PRIMARY KEY,thread TEXT NOT NULL REFERENCES threads(id),actor TEXT NOT NULL,name TEXT NOT NULL,verified INTEGER NOT NULL,body TEXT NOT NULL,created INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS participants(thread TEXT NOT NULL REFERENCES threads(id),principal TEXT NOT NULL REFERENCES principals(id),PRIMARY KEY(thread,principal));
  CREATE TABLE IF NOT EXISTS placements(thread TEXT NOT NULL REFERENCES threads(id),revision TEXT NOT NULL REFERENCES revisions(id),status TEXT NOT NULL,anchor TEXT NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(thread,revision));
@@ -218,6 +223,149 @@ impl Core {
         owner(&c, p, v["share_id"].as_str().unwrap())?;
         Ok(v)
     }
+    /// Staging and freezing share the same durable transaction boundary.
+    pub fn stage_upload(
+        &self,
+        p: &Principal,
+        uid: &str,
+        files: &BTreeMap<String, Vec<u8>>,
+        _entrypoint: &str,
+    ) -> Result<Value, AppError> {
+        validate_files(files, files.keys().next().map(String::as_str).unwrap_or(""))?;
+        let mut c = self.lock()?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let u = upload(&tx, uid)?;
+        let sid = u["share_id"].as_str().unwrap();
+        owner(&tx, p, sid)?;
+        writable(&tx, sid)?;
+        if u["expires_at"].as_i64().unwrap_or(0) < now() {
+            return Err(err(410, "expired_upload", "Upload session expired"));
+        }
+        if u["revision_id"].is_string() {
+            return Err(err(
+                409,
+                "already_finalized",
+                "Upload was already finalized",
+            ));
+        }
+        let frozen: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM finalize_requests WHERE upload=?)",
+            [uid],
+            |r| r.get(0),
+        )?;
+        if frozen {
+            return Err(err(
+                409,
+                "upload_frozen",
+                "Upload is frozen for its finalization request",
+            ));
+        }
+        tx.execute("INSERT INTO upload_staging(upload,files) VALUES(?,?) ON CONFLICT(upload) DO UPDATE SET files=excluded.files",params![uid,serde_json::to_vec(files).unwrap()])?;
+        tx.commit()?;
+        Ok(json!({"staged":true,"upload_id":uid}))
+    }
+    pub fn staged_files(
+        &self,
+        p: &Principal,
+        uid: &str,
+    ) -> Result<(BTreeMap<String, Vec<u8>>, String), AppError> {
+        let c = self.lock()?;
+        let u = upload(&c, uid)?;
+        owner(&c, p, u["share_id"].as_str().unwrap())?;
+        let bytes: Option<Vec<u8>> = c
+            .query_row(
+                "SELECT files FROM upload_staging WHERE upload=?",
+                [uid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let files =
+            serde_json::from_slice(&bytes.ok_or_else(|| {
+                err(409, "incomplete_upload", "Upload files before finalization")
+            })?)
+            .map_err(|_| err(500, "storage_error", "Invalid staging record"))?;
+        Ok((files, "index.html".into()))
+    }
+    pub fn begin_finalize(
+        &self,
+        p: &Principal,
+        uid: &str,
+        key: &str,
+        entrypoint: &str,
+    ) -> Result<Value, AppError> {
+        validate_finalize_key(key)?;
+        let mut c = self.lock()?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let u = upload(&tx, uid)?;
+        let sid = u["share_id"].as_str().unwrap();
+        owner(&tx, p, sid)?;
+        writable(&tx, sid)?;
+        let old: Option<(String,String,i64,Option<String>)>=tx.query_row("SELECT upload,entrypoint,share_version,result FROM finalize_requests WHERE owner=? AND key=?",params![p.id,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        if let Some((old_uid, old_entry, version, result)) = old {
+            if old_uid != uid || old_entry != entrypoint {
+                return Err(err(
+                    409,
+                    "idempotency_conflict",
+                    "Finalization key already binds different input",
+                ));
+            }
+            let result = result
+                .map(|s| {
+                    serde_json::from_str::<Value>(&s)
+                        .map_err(|_| err(500, "storage_error", "Invalid finalization receipt"))
+                })
+                .transpose()?;
+            if let Some(failure) = finalization_failure(&tx, uid)? {
+                return Err(failure);
+            }
+            if result.is_none() && version != share_version(&tx, sid)? {
+                return Err(err(
+                    409,
+                    "stale_build",
+                    "Share changed after finalization began",
+                ));
+            }
+            return Ok(
+                json!({"entrypoint":entrypoint,"expected_share_version":version,"result":result}),
+            );
+        }
+        let frozen: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM finalize_requests WHERE upload=?)",
+            [uid],
+            |r| r.get(0),
+        )?;
+        if frozen {
+            return Err(err(
+                409,
+                "idempotency_conflict",
+                "Upload already binds another finalization key",
+            ));
+        }
+        if u["revision_id"].is_string() {
+            return Err(err(
+                409,
+                "already_finalized",
+                "Upload was already finalized",
+            ));
+        }
+        if u["expires_at"].as_i64().unwrap_or(0) < now() {
+            return Err(err(410, "expired_upload", "Upload session expired"));
+        }
+        let bytes: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT files FROM upload_staging WHERE upload=?",
+                [uid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let bytes = bytes
+            .ok_or_else(|| err(409, "incomplete_upload", "Upload files before finalization"))?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let version = share_version(&tx, sid)?;
+        tx.execute("INSERT INTO finalize_requests(owner,key,upload,entrypoint,source_digest,share_version,result) VALUES(?,?,?,?,?,?,NULL)",params![p.id,key,uid,entrypoint,digest,version])?;
+        tx.commit()?;
+        Ok(json!({"entrypoint":entrypoint,"expected_share_version":version,"result":null}))
+    }
     pub fn publish(
         &self,
         p: &Principal,
@@ -225,13 +373,108 @@ impl Core {
         files: &BTreeMap<String, Vec<u8>>,
         entrypoint: &str,
     ) -> Result<Value, AppError> {
+        self.publish_inner(p, uid, files, entrypoint, None, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_finalized(
+        &self,
+        p: &Principal,
+        uid: &str,
+        key: &str,
+        files: &BTreeMap<String, Vec<u8>>,
+        entrypoint: &str,
+        warnings: &Value,
+    ) -> Result<Value, AppError> {
+        self.publish_inner(p, uid, files, entrypoint, Some((key, warnings)), None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_claimed(
+        &self,
+        p: &Principal,
+        uid: &str,
+        key: &str,
+        claim: &str,
+        files: &BTreeMap<String, Vec<u8>>,
+        entrypoint: &str,
+        warnings: &Value,
+    ) -> Result<Value, AppError> {
+        self.publish_inner(
+            p,
+            uid,
+            files,
+            entrypoint,
+            Some((key, warnings)),
+            Some(claim),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn publish_inner(
+        &self,
+        p: &Principal,
+        uid: &str,
+        files: &BTreeMap<String, Vec<u8>>,
+        entrypoint: &str,
+        finalized: Option<(&str, &Value)>,
+        claim: Option<&str>,
+    ) -> Result<Value, AppError> {
         auth(p)?;
         let mut c = self.lock()?;
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let u = upload(&tx, uid)?;
         let sid = u["share_id"].as_str().unwrap();
         owner(&tx, p, sid)?;
         writable(&tx, sid)?;
+        let reservation: Option<(String, i64, Option<String>, String)> = tx
+            .query_row(
+                "SELECT key,share_version,result,source_digest FROM finalize_requests WHERE upload=? AND owner=?",
+                params![uid, p.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        match (&reservation, finalized) {
+            (Some((reserved_key, version, result, source_digest)), Some((key, _)))
+                if reserved_key == key =>
+            {
+                if let Some(result) = result {
+                    return serde_json::from_str(result)
+                        .map_err(|_| err(500, "storage_error", "Invalid finalization receipt"));
+                }
+                if let Some(failure) = finalization_failure(&tx, uid)? {
+                    return Err(failure);
+                }
+                check_finalize_claim(&tx, uid, claim)?;
+                if *version != share_version(&tx, sid)? {
+                    return Err(err(
+                        409,
+                        "stale_build",
+                        "Share changed after finalization began",
+                    ));
+                }
+                let bytes: Vec<u8> = tx.query_row(
+                    "SELECT files FROM upload_staging WHERE upload=?",
+                    [uid],
+                    |r| r.get(0),
+                )?;
+                if *source_digest != format!("{:x}", Sha256::digest(&bytes)) {
+                    return Err(err(409, "source_changed", "Frozen upload source changed"));
+                }
+            }
+            (Some(_), _) => {
+                return Err(err(
+                    409,
+                    "upload_frozen",
+                    "Upload belongs to a different finalization request",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(err(
+                    409,
+                    "finalization_required",
+                    "Reserve finalization before publication",
+                ));
+            }
+            (None, None) => {}
+        }
         if let Some(r) = u["revision_id"].as_str() {
             let mut s = share(&tx, sid, true)?;
             s["revision_id"] = json!(r);
@@ -273,6 +516,7 @@ impl Core {
             "UPDATE shares SET latest=?,state='published' WHERE id=?",
             params![rid, sid],
         )?;
+        bump_share_version(&tx, sid)?;
         let origins = {
             let mut q = tx.prepare("SELECT id,anchor FROM threads WHERE share=? AND resolved=0")?;
 
@@ -291,6 +535,13 @@ impl Core {
         }
         let mut out = share(&tx, sid, true)?;
         out["revision_id"] = json!(rid);
+        if let Some((key, warnings)) = finalized {
+            out = json!({"share_id":sid,"revision_id":rid,"viewer_url":format!("/s/{}",out["capability"].as_str().unwrap()),"state":"ready","warnings":warnings});
+            tx.execute(
+                "UPDATE finalize_requests SET result=? WHERE owner=? AND key=? AND upload=?",
+                params![out.to_string(), p.id, key, uid],
+            )?;
+        }
         tx.commit()?;
         Ok(out)
     }
@@ -361,6 +612,54 @@ impl Core {
         revision: &str,
         anchor: Value,
     ) -> Result<Value, AppError> {
+        self.add_thread_inner(capability, p, guest_name, body, revision, anchor, None)
+    }
+    /// The transport supplies an authenticated principal or signed guest-cookie scope.
+    /// Receipts remain available for the lifetime of the retained comment data.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_thread_idempotent(
+        &self,
+        capability: &str,
+        p: Option<&Principal>,
+        guest_name: Option<&str>,
+        body: &str,
+        revision: &str,
+        anchor: Value,
+        key: &str,
+        actor_scope: &str,
+    ) -> Result<Value, AppError> {
+        validate_comment_idempotency(p, key, actor_scope)?;
+        self.add_thread_inner(
+            capability,
+            p,
+            guest_name,
+            body,
+            revision,
+            anchor,
+            Some((key, actor_scope)),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn add_thread_inner(
+        &self,
+        capability: &str,
+        p: Option<&Principal>,
+        guest_name: Option<&str>,
+        body: &str,
+        revision: &str,
+        anchor: Value,
+        receipt: Option<(&str, &str)>,
+    ) -> Result<Value, AppError> {
+        let fingerprint = comment_fingerprint(&json!({
+            "guest_name": guest_name, "body": body, "revision": revision, "anchor": anchor,
+        }));
+        let mut c = self.lock()?;
+        // Serialize writers before taking the replay snapshot, including other Core instances.
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let sid = view(&tx, capability, p)?;
+        if let Some(result) = replay_comment(&tx, &sid, "thread", receipt, &fingerprint)? {
+            return Ok(result);
+        }
         valid_body(body)?;
         if anchor.to_string().len() > 16384 || !anchor.is_object() {
             return Err(err(
@@ -369,9 +668,6 @@ impl Core {
                 "Anchor must be a bounded JSON object",
             ));
         }
-        let mut c = self.lock()?;
-        let tx = c.transaction()?;
-        let sid = view(&tx, capability, p)?;
         let valid: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM revisions WHERE id=? AND share=?)",
             params![revision, sid],
@@ -390,8 +686,10 @@ impl Core {
             "INSERT INTO threads VALUES(?,?,?,?,0,?)",
             params![tid, sid, revision, anchor.to_string(), now()],
         )?;
-        post(&tx, &sid, &tid, &actor, p, body, now())?;
-        let result = thread(&tx, &tid)?;
+        let comment_id = post(&tx, &sid, &tid, &actor, p, body, now())?;
+        let mut result = thread(&tx, &tid)?;
+        comment_mutation(&mut result, receipt, "thread", &comment_id);
+        save_comment_receipt(&tx, &sid, "thread", receipt, &fingerprint, &result)?;
         tx.commit()?;
         Ok(result)
     }
@@ -403,14 +701,54 @@ impl Core {
         guest_name: Option<&str>,
         body: &str,
     ) -> Result<Value, AppError> {
-        valid_body(body)?;
+        self.reply_inner(capability, tid, p, guest_name, body, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn reply_idempotent(
+        &self,
+        capability: &str,
+        tid: &str,
+        p: Option<&Principal>,
+        guest_name: Option<&str>,
+        body: &str,
+        key: &str,
+        actor_scope: &str,
+    ) -> Result<Value, AppError> {
+        validate_comment_idempotency(p, key, actor_scope)?;
+        self.reply_inner(
+            capability,
+            tid,
+            p,
+            guest_name,
+            body,
+            Some((key, actor_scope)),
+        )
+    }
+    fn reply_inner(
+        &self,
+        capability: &str,
+        tid: &str,
+        p: Option<&Principal>,
+        guest_name: Option<&str>,
+        body: &str,
+        receipt: Option<(&str, &str)>,
+    ) -> Result<Value, AppError> {
+        let fingerprint = comment_fingerprint(&json!({
+            "guest_name": guest_name, "body": body, "thread": tid,
+        }));
         let mut c = self.lock()?;
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let sid = view(&tx, capability, p)?;
+        if let Some(result) = replay_comment(&tx, &sid, "reply", receipt, &fingerprint)? {
+            return Ok(result);
+        }
+        valid_body(body)?;
         thread_belongs(&tx, &sid, tid)?;
         let a = actor(&tx, p, guest_name)?;
-        post(&tx, &sid, tid, &a, p, body, now())?;
-        let result = thread(&tx, tid)?;
+        let comment_id = post(&tx, &sid, tid, &a, p, body, now())?;
+        let mut result = thread(&tx, tid)?;
+        comment_mutation(&mut result, receipt, "reply", &comment_id);
+        save_comment_receipt(&tx, &sid, "reply", receipt, &fingerprint, &result)?;
         tx.commit()?;
         Ok(result)
     }
@@ -433,7 +771,7 @@ impl Core {
     }
     pub fn lifecycle(&self, p: &Principal, sid: &str, action: &str) -> Result<Value, AppError> {
         let mut c = self.lock()?;
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         owner(&tx, p, sid)?;
         let state: String =
             tx.query_row("SELECT state FROM shares WHERE id=?", [sid], |r| r.get(0))?;
@@ -453,6 +791,7 @@ impl Core {
             _ => return Err(err(409, "state_conflict", "Invalid lifecycle transition")),
         };
         tx.execute("UPDATE shares SET state=? WHERE id=?", params![next, sid])?;
+        bump_share_version(&tx, sid)?;
         if next != "published" {
             tx.execute("UPDATE batches SET state='cancelled',error='share unavailable' WHERE share=? AND state IN ('pending','sending')",[sid])?;
         }
@@ -532,6 +871,129 @@ impl Core {
         let rows=q.query_map([sid],|r|Ok(json!({"id":r.get::<_,String>(0)?,"recipient":r.get::<_,String>(1)?,"due_at":r.get::<_,i64>(2)?,"state":r.get::<_,String>(3)?,"error":r.get::<_,Option<String>>(4)?})))?.collect::<Result<Vec<_>,_>>()?;
         Ok(json!(rows))
     }
+}
+/// Scope is trusted transport input, never a guest display name or request field.
+/// Keep authenticated scopes bound to the actual principal even for direct store callers.
+pub(crate) fn validate_comment_idempotency(
+    p: Option<&Principal>,
+    key: &str,
+    scope: &str,
+) -> Result<(), AppError> {
+    if key.trim().is_empty()
+        || key.len() > 200
+        || key.chars().any(char::is_control)
+        || scope.trim().is_empty()
+        || scope.len() > 512
+        || scope.chars().any(char::is_control)
+    {
+        return Err(err(
+            400,
+            "invalid_idempotency_key",
+            "A bounded idempotency key and actor scope are required",
+        ));
+    }
+    if let Some(p) = p {
+        auth(p)?;
+        if scope != format!("auth:{}", p.id) {
+            return Err(err(
+                403,
+                "invalid_actor_scope",
+                "Actor scope must match the authenticated principal",
+            ));
+        }
+    } else if !scope.starts_with("guest:") || scope.len() <= "guest:".len() {
+        return Err(err(
+            400,
+            "invalid_actor_scope",
+            "A signed guest actor scope is required",
+        ));
+    }
+    Ok(())
+}
+pub(crate) fn comment_fingerprint(payload: &Value) -> String {
+    // serde_json's sorted object keys give stable structural JSON without trimming any input.
+    format!("{:x}", Sha256::digest(payload.to_string().as_bytes()))
+}
+pub(crate) fn comment_mutation(
+    response: &mut Value,
+    receipt: Option<(&str, &str)>,
+    operation: &str,
+    comment_id: &str,
+) {
+    if let Some((key, _)) = receipt {
+        response["_mutation"] = json!({
+            "idempotency_key": key, "operation": operation, "comment_id": comment_id,
+        });
+    }
+}
+pub(crate) fn comment_response_json(response: &Value) -> Result<String, AppError> {
+    let encoded = response.to_string();
+    // Store JSON as a string rather than an indexed nested map in Firestore. Leave ample
+    // headroom below its 1 MiB document limit; both adapters enforce the same bound.
+    if encoded.len() > 512 * 1024 {
+        return Err(err(
+            413,
+            "comment_response_limit",
+            "Thread exceeds the durable comment response limit",
+        ));
+    }
+    Ok(encoded)
+}
+pub(crate) fn replay_comment_response(
+    fingerprint: &str,
+    old_fingerprint: &str,
+    response: &str,
+) -> Result<Value, AppError> {
+    if old_fingerprint != fingerprint {
+        return Err(err(
+            409,
+            "idempotency_conflict",
+            "Key already used with different comment input",
+        ));
+    }
+    serde_json::from_str(response).map_err(|_| {
+        err(
+            500,
+            "invalid_comment_receipt",
+            "Stored comment response is unavailable",
+        )
+    })
+}
+fn replay_comment(
+    c: &Connection,
+    sid: &str,
+    operation: &str,
+    receipt: Option<(&str, &str)>,
+    fingerprint: &str,
+) -> Result<Option<Value>, AppError> {
+    let Some((key, scope)) = receipt else {
+        return Ok(None);
+    };
+    let old: Option<(String, String)> = c.query_row(
+        "SELECT fingerprint,response_json FROM comment_receipts WHERE share=? AND actor_scope=? AND operation=? AND request_key=?",
+        params![sid, scope, operation, key], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    old.map(|(old_fingerprint, response)| {
+        replay_comment_response(fingerprint, &old_fingerprint, &response)
+    })
+    .transpose()
+}
+fn save_comment_receipt(
+    c: &Connection,
+    sid: &str,
+    operation: &str,
+    receipt: Option<(&str, &str)>,
+    fingerprint: &str,
+    response: &Value,
+) -> Result<(), AppError> {
+    if let Some((key, scope)) = receipt {
+        let encoded = comment_response_json(response)?;
+        c.execute(
+            "INSERT INTO comment_receipts VALUES(?,?,?,?,?,?,?)",
+            params![sid, scope, operation, key, fingerprint, encoded, now()],
+        )?;
+    }
+    Ok(())
 }
 fn save_principal(c: &Connection, p: &Principal) -> Result<(), AppError> {
     auth(p)?;
@@ -647,10 +1109,11 @@ fn post(
     p: Option<&Principal>,
     body: &str,
     at: i64,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
+    let comment_id = id();
     c.execute(
         "INSERT INTO comments VALUES(?,?,?,?,?,?,?)",
-        params![id(), tid, a.0, a.1, a.2, body, at],
+        params![comment_id, tid, a.0, a.1, a.2, body, at],
     )?;
     if let Some(p) = p {
         c.execute(
@@ -694,7 +1157,7 @@ fn post(
             params![bid, eid],
         )?;
     }
-    Ok(())
+    Ok(comment_id)
 }
 fn thread(c: &Connection, tid: &str) -> Result<Value, AppError> {
     let mut v=c.query_row("SELECT id,share,revision,anchor,resolved,created FROM threads WHERE id=?",[tid],|r|{let a:String=r.get(3)?;Ok(json!({"id":r.get::<_,String>(0)?,"share_id":r.get::<_,String>(1)?,"original_revision":r.get::<_,String>(2)?,"original_anchor":serde_json::from_str::<Value>(&a).unwrap_or(json!({})),"resolved":r.get::<_,bool>(4)?,"created_at":r.get::<_,i64>(5)?}))})?;
@@ -808,3 +1271,171 @@ fn rematch(anchor: &Value, files: &BTreeMap<String, Vec<u8>>) -> (&'static str, 
 #[cfg(test)]
 #[path = "core_tests.rs"]
 mod core_tests;
+
+pub fn validate_finalize_key(key: &str) -> Result<(), AppError> {
+    if key.trim().is_empty() || key.len() > 200 || key.chars().any(char::is_control) {
+        return Err(err(
+            400,
+            "invalid_idempotency_key",
+            "A finalization idempotency key of 1–200 bytes is required",
+        ));
+    }
+    Ok(())
+}
+fn share_version(c: &Connection, sid: &str) -> Result<i64, AppError> {
+    Ok(c.query_row(
+        "SELECT version FROM share_versions WHERE share=?",
+        [sid],
+        |r| r.get(0),
+    )
+    .optional()?
+    .unwrap_or(0))
+}
+fn bump_share_version(c: &Connection, sid: &str) -> Result<(), AppError> {
+    c.execute("INSERT INTO share_versions(share,version) VALUES(?,1) ON CONFLICT(share) DO UPDATE SET version=version+1", [sid])?;
+    Ok(())
+}
+
+fn finalization_failure(c: &Connection, uid: &str) -> Result<Option<AppError>, AppError> {
+    let raw: Option<Option<String>> = c
+        .query_row(
+            "SELECT error FROM finalize_attempts WHERE upload=?",
+            [uid],
+            |r| r.get(0),
+        )
+        .optional()?;
+    raw.flatten()
+        .map(|raw| {
+            let v: Value = serde_json::from_str(&raw)
+                .map_err(|_| err(500, "storage_error", "Invalid finalization failure receipt"))?;
+            Ok(AppError {
+                status: v["status"].as_u64().unwrap_or(500) as u16,
+                code: v["code"].as_str().unwrap_or("preparation_failed").into(),
+                message: v["message"].as_str().unwrap_or("Preparation failed").into(),
+            })
+        })
+        .transpose()
+}
+fn check_finalize_claim(c: &Connection, uid: &str, claim: Option<&str>) -> Result<(), AppError> {
+    let current: Option<(String, i64)> = c
+        .query_row(
+            "SELECT claim,lease_until FROM finalize_attempts WHERE upload=?",
+            [uid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match (current, claim) {
+        (None, None) => Ok(()),
+        (Some((current, lease)), Some(claim)) if current == claim && lease > now() => Ok(()),
+        _ => Err(err(
+            409,
+            "finalization_lease_lost",
+            "Finalization is running in another attempt; retry the original request",
+        )),
+    }
+}
+impl Core {
+    /// A bounded durable claim prevents overlapping source builds from publishing
+    /// after another attempt has recorded a definitive failure or taken over.
+    pub fn claim_finalize(&self, p: &Principal, uid: &str, key: &str) -> Result<Value, AppError> {
+        let mut c = self.lock()?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let u = upload(&tx, uid)?;
+        let sid = u["share_id"].as_str().unwrap();
+        owner(&tx, p, sid)?;
+        writable(&tx, sid)?;
+        let request:Option<(i64,Option<String>)>=tx.query_row("SELECT share_version,result FROM finalize_requests WHERE owner=? AND key=? AND upload=?",params![p.id,key,uid],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let (version, result) = request.ok_or_else(|| {
+            err(
+                409,
+                "idempotency_conflict",
+                "Finalization request does not match",
+            )
+        })?;
+        if let Some(result) = result {
+            return Ok(
+                json!({"result":serde_json::from_str::<Value>(&result).map_err(|_|err(500,"storage_error","Invalid finalization receipt"))?}),
+            );
+        }
+        if let Some(failure) = finalization_failure(&tx, uid)? {
+            return Err(failure);
+        }
+        if version != share_version(&tx, sid)? {
+            return Err(err(
+                409,
+                "stale_build",
+                "Share changed after finalization began",
+            ));
+        }
+        if u["expires_at"].as_i64().unwrap_or(0) < now() {
+            return Err(err(410, "expired_upload", "Upload session expired"));
+        }
+        let lease: Option<i64> = tx
+            .query_row(
+                "SELECT lease_until FROM finalize_attempts WHERE upload=?",
+                [uid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if lease.is_some_and(|lease| lease > now()) {
+            return Err(err(
+                409,
+                "finalize_in_progress",
+                "This finalization is still running; retry the original request",
+            ));
+        }
+        let claim = id();
+        let lease = now() + 300;
+        tx.execute("INSERT INTO finalize_attempts(upload,claim,lease_until,error) VALUES(?,?,?,NULL) ON CONFLICT(upload) DO UPDATE SET claim=excluded.claim,lease_until=excluded.lease_until,error=NULL",params![uid,claim,lease])?;
+        tx.commit()?;
+        Ok(json!({"claim_id":claim,"lease_expires_at":lease,"result":null}))
+    }
+    /// Only the current live attempt can commit a terminal failure. Transient
+    /// busy/unavailable outcomes release its claim without ending the request.
+    pub fn record_finalize_failure(
+        &self,
+        p: &Principal,
+        uid: &str,
+        key: &str,
+        claim: &str,
+        failure: &AppError,
+    ) -> Result<Value, AppError> {
+        let mut c = self.lock()?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let u = upload(&tx, uid)?;
+        let sid = u["share_id"].as_str().unwrap();
+        owner(&tx, p, sid)?;
+        writable(&tx, sid)?;
+        let request:Option<(i64,Option<String>)>=tx.query_row("SELECT share_version,result FROM finalize_requests WHERE owner=? AND key=? AND upload=?",params![p.id,key,uid],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let (version, result) = request.ok_or_else(|| {
+            err(
+                409,
+                "idempotency_conflict",
+                "Finalization request does not match",
+            )
+        })?;
+        if let Some(result) = result {
+            return serde_json::from_str(&result)
+                .map_err(|_| err(500, "storage_error", "Invalid finalization receipt"));
+        }
+        if let Some(old) = finalization_failure(&tx, uid)? {
+            return Err(old);
+        }
+        check_finalize_claim(&tx, uid, Some(claim))?;
+        if version != share_version(&tx, sid)? {
+            return Err(err(
+                409,
+                "stale_build",
+                "Share changed after finalization began",
+            ));
+        }
+        let terminal = (400..500).contains(&failure.status);
+        let stored = terminal.then(|| serde_json::to_string(failure).unwrap());
+        tx.execute(
+            "UPDATE finalize_attempts SET lease_until=0,error=? WHERE upload=? AND claim=?",
+            params![stored, uid, claim],
+        )?;
+        tx.commit()?;
+        Err(failure.clone())
+    }
+}
