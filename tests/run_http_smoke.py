@@ -1,7 +1,7 @@
 """Real loopback HTTP service smoke test. Only our source fixtures execute."""
 import base64,json,os,pathlib,socket,subprocess,tempfile,time,urllib.request,urllib.error
-root=pathlib.Path(__file__).resolve().parents[1];env=os.environ.copy();env.update(CARGO_HOME='/workspace/shared/wipstash-toolchain/cargo',RUSTUP_HOME='/workspace/shared/wipstash-toolchain/rustup')
-subprocess.run([env['CARGO_HOME']+'/bin/cargo','build'],cwd=root,env=env,check=True)
+root=pathlib.Path(__file__).resolve().parents[1];env=os.environ.copy()
+subprocess.run([env.get('CARGO', 'cargo'),'build','--locked'],cwd=root,env=env,check=True)
 for target,source in [('ARTIFACT_BUILD_HTTP_PROXY','HTTP_PROXY'),('ARTIFACT_BUILD_HTTPS_PROXY','HTTPS_PROXY'),('ARTIFACT_BUILD_CA_FILE','NODE_EXTRA_CA_CERTS')]:
  if source in env:env[target]=env[source]
 base='http://127.0.0.1:4319';cookie=''

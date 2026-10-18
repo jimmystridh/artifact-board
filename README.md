@@ -6,13 +6,11 @@ A Rust review workspace with a real Dioxus server-rendered management interface.
 
 ## Run locally
 
-Prerequisites: Rust 1.99.1, Node 24/npm for explicitly enabled trusted-source builds. In this workspace the verified Rust toolchain is scoped:
+Prerequisites: Rust 1.99.1, Node 24/npm for explicitly enabled trusted-source builds. Use your normal Rust installation:
 
 ```sh
-export CARGO_HOME=/workspace/shared/wipstash-toolchain/cargo
-export RUSTUP_HOME=/workspace/shared/wipstash-toolchain/rustup
-export PATH="$CARGO_HOME/bin:$PATH"
-cargo run -- --dev-fixtures
+rustup toolchain install 1.99.1 --profile minimal
+cargo +1.99.1 run --locked -- --dev-fixtures
 ```
 
 Open http://127.0.0.1:4317. Synthetic development login is visible and is permitted only on loopback, never Cloud Run. Data defaults to `.local/local-fixture.sqlite`; this is not production persistence. Use `ARTIFACT_DATA_DIR` to choose a disposable local directory.
@@ -60,19 +58,23 @@ Lifecycle prototype: unpublish/archive/delete revoke viewing of all revisions; d
 
 ```sh
 cargo test
-node assets/bridge.test.cjs
+node --test assets/*.test.cjs
 python3 tests/run_http_smoke.py
 python3 tests/run_firestore_contract.py -- --test firestore_domain -- --ignored --nocapture
 python3 tests/run_firestore_contract.py -- --test http firestore_http -- --ignored --nocapture
 python3 tests/run_browser.py
 ```
 
-`run_firestore_contract.py` starts the official Firestore emulator and a clearly labeled fake GCS HTTP server in the same process namespace as tests. Its JAR must first be installed using official Firebase tools. The emulator requires Java 21. The real React smoke test intentionally runs only authored fixtures with operator-enabled trusted mode. Tests marked ignored require their named external/local fixture; an ordinary `cargo test` does not execute them.
+`run_firestore_contract.py` starts the official Firestore emulator and a clearly labeled fake GCS HTTP server in the same process namespace as tests. Its JAR must first be installed using official Firebase tools; set `ARTIFACT_FIRESTORE_EMULATOR_JAR` to its path when installed elsewhere. The HTTP and Firestore runners use `cargo` from your PATH (or the `CARGO` executable override) and preserve your toolchain environment. The emulator requires Java 21. The real React smoke test intentionally runs only authored fixtures with operator-enabled trusted mode. Tests marked ignored require their named external/local fixture; an ordinary `cargo test` does not execute them.
 
-Browser QA is currently **blocked by this executor's Chromium socket permission** before a page opens, even with Chromium sandbox enabled. The app/Chromium runner and desktop/mobile scenarios are provided, but no rendered-browser pass or screenshot is claimed. Live Entra, Slack, GCS and Cloud Run tests have not run. See [validation report](docs/TEST-REPORT.md).
+Rendered browser acceptance is **skipped at the user's direction** after environment-boundary failures. The supported cloud browser cannot reach the execution namespace's loopback app, and the reviewed host launch fails at its filesystem boundary. Earlier local Chromium startup was also blocked. Desktop/mobile scenarios are provided, but no rendered-browser pass or screenshot is claimed. Live Entra, Slack, GCS and Cloud Run tests have not run. See [validation report](docs/TEST-REPORT.md).
 
 ## Review coverage and limits
 
 Normal content clicks do not create annotations; explicit element mode and text selection use a bounded parent/source/nonce bridge. Original anchors/revisions are immutable. Later matches are conservative and labeled possible/unmatched. Duplicated quotes are not called exact. Shadow DOM, canvas, nested frames, cross-node quote highlighting and dynamically replaced targets may remain list-only; general feedback and original context remain available.
 
 The browser boundary requires actual browser verification before release. Untrusted source isolation, identity admission/verified-email policy, real service permissions, operational retention and recovery, production domain/origin routing and live integration validation remain release gates. No analytics or permanent purge is silently added.
+
+## Continuous integration
+
+The source-checks workflow runs locked Rust tests, strict Clippy, formatting and all Node behavior regressions on pushes to main and pull requests, with read-only repository permissions and commit-pinned official GitHub actions. It does not execute the explicitly ignored emulator/React integration fixtures, browser acceptance, or live service tests; a green source-checks run is not full product acceptance.

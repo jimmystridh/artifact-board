@@ -2,3 +2,5 @@
 /.local/
 /node_modules/
 *.sqlite*
+
+__pycache__/

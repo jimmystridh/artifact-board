@@ -66,16 +66,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('cargo_args', nargs=argparse.REMAINDER)
     args = parser.parse_args()
-    jar = ROOT / '.local/firebase-home/.cache/firebase/emulators/cloud-firestore-emulator-v1.22.0.jar'
+    jar = Path(os.environ.get('ARTIFACT_FIRESTORE_EMULATOR_JAR', ROOT / '.local/firebase-home/.cache/firebase/emulators/cloud-firestore-emulator-v1.22.0.jar'))
     if not jar.is_file():
         raise SystemExit('Official Firestore emulator JAR missing; install locally first.')
     env = os.environ.copy()
-    env.update(CARGO_HOME='/workspace/shared/wipstash-toolchain/cargo', RUSTUP_HOME='/workspace/shared/wipstash-toolchain/rustup')
-    env['PATH'] = env['CARGO_HOME'] + '/bin:' + env['PATH']
     env.update(ARTIFACT_TEST_FIRESTORE_URL='http://127.0.0.1:8187', FIRESTORE_EMULATOR_URL='http://127.0.0.1:8187', GCS_EMULATOR_URL='http://127.0.0.1:4443')
     gcs = http.server.ThreadingHTTPServer(('127.0.0.1', 4443), FakeGCS)
     threading.Thread(target=gcs.serve_forever, daemon=True).start()
     log_path = ROOT / '.local/firestore-contract.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open('w') as log:
         java = subprocess.Popen(['java', '-jar', str(jar), '--host=127.0.0.1', '--port=8187', '--project_id=demo-artifact-board'], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
         try:
@@ -93,7 +92,7 @@ def main():
             extra = args.cargo_args
             if extra and extra[0] == '--':
                 extra = extra[1:]
-            command = ['cargo', 'test'] + (extra or ['firestore_emulator_transaction_contract', '--', '--ignored', '--nocapture'])
+            command = [env.get('CARGO', 'cargo'), 'test', '--locked'] + (extra or ['firestore_emulator_transaction_contract', '--', '--ignored', '--nocapture'])
             print('Running real Firestore emulator + fake GCS contract fixtures.', flush=True)
             return subprocess.call(command, cwd=ROOT, env=env)
         finally:

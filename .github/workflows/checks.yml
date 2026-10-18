@@ -1,0 +1,36 @@
+name: Source checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: source-checks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Install verified Rust toolchain
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+      - name: Format
+        run: cargo +1.99.1 fmt --check
+      - name: Strict lint
+        run: cargo +1.99.1 clippy --locked --all-targets -- -D warnings
+      - name: Rust service and boundary tests
+        run: cargo +1.99.1 test --locked
+      - name: JavaScript behavior regressions
+        run: node --test assets/*.test.cjs
+      - name: Application and fixture syntax
+        run: |
+          node --check assets/app.js
+          node --check assets/bridge.js
+          python3 -m py_compile tests/run_http_smoke.py tests/run_firestore_contract.py

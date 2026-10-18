@@ -54,3 +54,11 @@ test('oversized placement batches and invalid selectors are ignored',()=>{
 test('gated frame ticket paths preserve only the artifact-relative path',()=>{
  const h=harness('/frame/capability/revision/signed-ticket/docs/hello%20world.html');h.message({type:'hello'});h.event('mouseup');assert.equal(h.messages[1].message.anchor.path,'docs/hello world.html');assert.ok(!JSON.stringify(h.messages[1]).includes('signed-ticket'));
 });
+
+test('anchors stay in their original artifact document despite shared IDs',()=>{
+ const h=harness('/frame/capability/revision/ticket/docs/one.html');h.message({type:'hello'});
+ h.message({type:'focus',anchor:{kind:'element',element_id:'intro',path:'docs/two.html'}});assert.equal(h.lookups,0);
+ h.message({type:'placements',threads:[{id:'thread',anchor:{kind:'element',element_id:'intro',path:'docs/two.html'}}]});assert.equal(h.lookups,0);
+ h.message({type:'focus',anchor:{kind:'element',element_id:'intro',path:{}}});assert.equal(h.lookups,0);
+ h.message({type:'focus',anchor:{kind:'element',element_id:'intro',path:'docs/one.html'}});assert.equal(h.lookups,1);
+});

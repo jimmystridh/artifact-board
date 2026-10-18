@@ -60,3 +60,17 @@ python3 tests/run_firestore_contract.py -- -- --include-ignored
 ## Acceptance interpretation
 
 Static/Markdown/React publication, MCP, discussion, immutable revision/lifecycle and batching have passing service-level tests. Browser-dependent portions of A01/A02/A08/A09/A17/A19 remain unverified. A06 admission and A16 lifecycle require final product-policy review plus live identity testing. A12 container isolation is **not** claimed; trusted-host execution was separately authorized and is clearly labeled. Tentative analytics A18 is not implemented. Passing tests do not close the operational/live-integration gates listed in OPERATIONS.md.
+
+## Acceptance hardening follow-up (18 October 2026)
+
+Rendered browser acceptance is now **skipped at the user's direction**. The supported cloud browser became available, but opening the running loopback app returned `ERR_CONNECTION_REFUSED` across execution namespaces. A narrowly reviewed host-boundary launch failed before starting the app at the filesystem sandbox boundary. No tunnels, public exposure, browser security changes or boundary workarounds were used. This does not establish a rendered desktop/mobile pass.
+
+Source-level fixes include preserving per-thread reply drafts across refresh/filter operations, reconciling a successfully posted reply without requiring a second successful read, rejecting stale discussion refresh results, and restricting annotation matching to the correct artifact document. Deterministic Node regressions exercise these paths; they are simulated DOM tests, not browser tests.
+
+The HTTP and Firestore runners now preserve the caller's Rust environment and support `CARGO`; Firestore supports `ARTIFACT_FIRESTORE_EMULATOR_JAR`. Fresh checkouts no longer depend on the original cloud workspace toolchain path. GitHub source-check CI covers default Rust tests, strict lint, formatting and Node regressions only; ignored integration tests and rendered/live acceptance are excluded explicitly.
+
+Revalidated locally: the full 68-execution Rust aggregate with all ignored tests enabled, real authored React source build/publication and failed replacement over HTTP, Clippy with warnings denied, formatting and Python runner syntax. Existing real-versus-fake service distinctions above are unchanged.
+
+Follow-up JavaScript result: **19 passed, 0 failed** (7 reply/draft/race acceptance regressions, 7 annotation bridge tests, 5 build-state tests). These do not close rendered-browser or live-integration gaps.
+
+Remaining interrupted-request limitation: a lost mutation acknowledgement (rather than a successful POST followed by failed refresh) is still ambiguous. In particular, manually retrying after a lost upload-finalize or comment/reply POST response may create another operation. End-to-end request recovery/idempotency for those UI paths is not claimed by this patch; inspect current state before retrying.
