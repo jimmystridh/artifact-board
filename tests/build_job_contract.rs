@@ -130,6 +130,12 @@ async fn durable_build_claim_dispatch_success_failure_and_lifecycle() {
         .arg("--dev-fixtures")
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
+        // Keep credentials scrubbed, but preserve the operator-selected runtime.
+        .envs(
+            std::env::var("ARTIFACT_NODE_BIN_DIR")
+                .ok()
+                .map(|path| ("ARTIFACT_NODE_BIN_DIR", path)),
+        )
         .env("ARTIFACT_STORE", "firestore")
         .env("GOOGLE_CLOUD_PROJECT", "artifact-build-test")
         .env("ARTIFACT_BUCKET", "artifact-build-test")
