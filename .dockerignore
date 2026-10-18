@@ -1,0 +1,5 @@
+.git
+.local
+target
+node_modules
+*.sqlite*

@@ -1,0 +1,10 @@
+'use strict';
+const {test}=require('node:test');const assert=require('node:assert/strict');const vm=require('node:vm');const fs=require('node:fs');
+const source=fs.readFileSync(require('node:path').join(__dirname,'app.js'),'utf8').split('// BEGIN BUILD STATUS HELPER')[1].split('// END BUILD STATUS HELPER')[0];
+const context={setTimeout,Date,Error};vm.runInNewContext(source,context);const wait=context.waitForBuild;
+test('queued/running never publish until succeeded, polling every second',async()=>{const statuses=['queued','dispatching','running','succeeded'],seen=[],delays=[];let reads=0,time=0;const result=await wait({read:async()=>({state:statuses[reads++]}),onStatus:s=>seen.push(s),sleep:async ms=>{delays.push(ms);time+=ms},now:()=>time});assert.equal(result.state,'succeeded');assert.deepEqual(seen,statuses);assert.deepEqual(delays,[1000,1000,1000]);assert.equal(reads,4)});
+test('failed and timed out are terminal failures, not publication',async()=>{for(const state of ['failed','timed_out','cancelled'])await assert.rejects(wait({read:async()=>({state}),now:()=>0}),e=>e.terminal===true)});
+test('status polling has a bounded observation window without claiming cancellation',async()=>{let time=0,reads=0;await assert.rejects(wait({read:async()=>{reads++;return {state:'running'}},sleep:async ms=>{time+=ms},now:()=>time,timeoutMs:3000}),/not been reported as published/);assert.equal(reads,3)});
+test('unknown status and transport errors do not imply success or terminal failure',async()=>{await assert.rejects(wait({read:async()=>({state:'mystery'}),now:()=>0}),e=>!e.terminal);await assert.rejects(wait({read:async()=>{throw Error('network unavailable')},now:()=>0}),/network unavailable/)});
+
+test('operator-blocked dispatch has a shorter bounded observation window and remains resumable',async()=>{let time=0,reads=0;await assert.rejects(wait({read:async()=>{reads++;return {state:'queued',operator_notice:'No dispatcher configured'}},sleep:async ms=>{time+=ms},now:()=>time}),e=>e.message==='No dispatcher configured'&&!e.terminal);assert.equal(reads,15)});
