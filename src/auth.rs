@@ -112,7 +112,7 @@ impl Auth {
             .unwrap_or(&self.local_key)
             .as_bytes()
     }
-    fn sign<T: Serialize>(&self, value: &T) -> String {
+    pub(crate) fn sign<T: Serialize>(&self, value: &T) -> String {
         jsonwebtoken::encode(
             &jsonwebtoken::Header::new(Algorithm::HS256),
             value,
@@ -120,7 +120,11 @@ impl Auth {
         )
         .expect("Serializable signed claim")
     }
-    fn decode<T: serde::de::DeserializeOwned>(&self, value: &str, audience: &str) -> Option<T> {
+    pub(crate) fn decode<T: serde::de::DeserializeOwned>(
+        &self,
+        value: &str,
+        audience: &str,
+    ) -> Option<T> {
         let mut v = Validation::new(Algorithm::HS256);
         v.set_audience(&[audience]);
         v.leeway = 0;
@@ -132,6 +136,9 @@ impl Auth {
         self.decode(&cookie(headers, "artifact_session")?, "artifact-session")
     }
     pub fn principal(&self, headers: &HeaderMap) -> Option<Principal> {
+        if headers.contains_key("authorization") {
+            return crate::oauth::access_claim(self, headers).map(|c| c.principal);
+        }
         self.session_claim(headers)
             .map(|s| s.principal)
             .filter(|p| {
@@ -145,6 +152,11 @@ impl Auth {
             })
     }
     pub fn gated_principal(&self, headers: &HeaderMap) -> Option<Principal> {
+        if headers.contains_key("authorization") {
+            return self
+                .principal(headers)
+                .filter(|_| self.config.dev || self.config.gated_tenant == self.config.tenant);
+        }
         self.session_claim(headers)
             .filter(|s| {
                 s.gated
@@ -274,10 +286,11 @@ impl Auth {
         })
     }
     pub fn mutation(&self, headers: &HeaderMap) -> Result<(), AppError> {
-        if headers
-            .get("x-artifact-request")
-            .and_then(|v| v.to_str().ok())
-            != Some("1")
+        if crate::oauth::access_claim(self, headers).is_none()
+            && headers
+                .get("x-artifact-request")
+                .and_then(|v| v.to_str().ok())
+                != Some("1")
         {
             return Err(error(403, "csrf", "Missing same-origin request marker."));
         }
@@ -505,6 +518,15 @@ impl Auth {
     }
 }
 pub fn safe_next(next: &str) -> &str {
+    if let Some(request) = next.strip_prefix("/oauth/consent?request=")
+        && !request.is_empty()
+        && request.len() <= 16000
+        && request
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return next;
+    }
     if next.starts_with("/s/")
         && next[3..]
             .bytes()

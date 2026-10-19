@@ -30,11 +30,15 @@ pub fn dashboard(data: Value) -> String {
     let name = field(&data["principal"], "display_name").to_owned();
     let shares = data["shares"].as_array().cloned().unwrap_or_default();
     let total = shares.len();
+    let mcp_url = format!("{}/mcp", field(&data, "origin").trim_end_matches('/'));
+    let add_command = format!("codex mcp add artifact-board --url {mcp_url}");
+    let claude_command =
+        format!("claude mcp add --transport http --scope user artifact-board {mcp_url}");
     document(
         "Your workspace",
         rsx! {
             div { id: "app", "data-page": "dashboard", "data-boot": "{boot}",
-                header { class: "topbar", Mark {} div { class: "account", span { class: "online-dot" } "{name}" button { id: "sign-out", class: "text-button", "Sign out" } } }
+                header { class: "topbar", Mark {} div { class: "account", span { class: "online-dot" } "{name}" a { class: "text-button", href: "/oauth/connections", "Connected agents" } button { id: "sign-out", class: "text-button", "Sign out" } } }
                 main { class: "dashboard",
                     div { class: "workspace-label", span { class: "tiny-square" } "YOUR WORKSPACE" }
                     section { class: "page-heading",
@@ -56,7 +60,85 @@ pub fn dashboard(data: Value) -> String {
                             p { id: "no-results", class: "hidden subtle", "No shares match your search." }
                         }
                         aside { class: "workspace-aside",
-                            div { class: "note-card", span { class: "eyebrow", "A LITTLE LESS BACK-AND-FORTH" } h2 { "Feedback, right where it belongs." } p { "Reviewers can highlight a sentence, point to an element, or start a conversation about the whole thing." } div { class: "mini-preview", div { class: "mini-line long" } div { class: "mini-line highlight" } div { class: "mini-line" } span { class: "mini-comment", "1" } } }
+                            section { class: "agent-help", aria_labelledby: "agent-help-title",
+                                span { class: "eyebrow", "WORK WITH YOUR AGENT" }
+                                h2 { id: "agent-help-title", "Connect your agent" }
+                                p { "Let your agent publish artifacts and work with feedback as you." }
+                                label { r#for: "agent-client", class: "agent-client-label", "Choose your agent" }
+                                select { id: "agent-client",
+                                    option { value: "codex", "Codex" }
+                                    option { value: "claude-code", "Claude Code" }
+                                    option { value: "claude-web", "Claude on the web" }
+                                    option { value: "chatgpt-web", "ChatGPT on the web" }
+                                }
+                                div { "data-agent-guide": "codex",
+                                ol { class: "agent-help-steps",
+                                    li {
+                                        h3 { "Add Artifact Board to Codex" }
+                                        div { class: "agent-command",
+                                            div { class: "agent-command-bar", span { "TERMINAL" } button { class: "text-button", "data-copy-command": "agent-add-command", aria_label: "Copy add command", "Copy" } }
+                                            pre { code { id: "agent-add-command", "{add_command}" } }
+                                        }
+                                    }
+                                    li {
+                                        h3 { "Sign in and approve access" }
+                                        div { class: "agent-command",
+                                            div { class: "agent-command-bar", span { "TERMINAL" } button { class: "text-button", "data-copy-command": "agent-login-command", aria_label: "Copy sign-in command", "Copy" } }
+                                            pre { code { id: "agent-login-command", "codex mcp login artifact-board" } }
+                                        }
+                                        p { "Follow the browser prompt, sign in with your work Microsoft account, and approve the connection. Then open a new Codex session." }
+                                    }
+                                }
+                                    a { class: "agent-guide-link", href: "https://developers.openai.com/codex/mcp", target: "_blank", rel: "noopener noreferrer", "Codex setup guide ↗" }
+                                }
+                                div { "data-agent-guide": "claude-code", hidden: true,
+                                    ol { class: "agent-help-steps",
+                                        li { h3 { "Add the server" }
+                                            div { class: "agent-command",
+                                                div { class: "agent-command-bar", span { "TERMINAL" } button { class: "text-button", "data-copy-command": "agent-claude-command", aria_label: "Copy Claude Code command", "Copy" } }
+                                                pre { code { id: "agent-claude-command", "{claude_command}" } }
+                                            }
+                                        }
+                                        li { h3 { "Connect in Claude Code" }
+                                            div { class: "agent-command",
+                                                div { class: "agent-command-bar", span { "IN CLAUDE CODE" } button { class: "text-button", "data-copy-command": "agent-claude-login", aria_label: "Copy Claude Code sign-in command", "Copy" } }
+                                                pre { code { id: "agent-claude-login", "/mcp" } }
+                                            }
+                                            p { "Open Claude Code, run /mcp, select artifact-board, and follow the browser sign-in. Use your work Microsoft account and approve access." }
+                                        }
+                                    }
+                                    a { class: "agent-guide-link", href: "https://code.claude.com/docs/en/mcp", target: "_blank", rel: "noopener noreferrer", "Claude Code setup guide ↗" }
+                                }
+                                div { "data-agent-guide": "claude-web", hidden: true,
+                                    ol { class: "agent-help-steps",
+                                        li { h3 { "Add a custom connector" } p { "In Claude, open Customize → Connectors → + Add → Add custom connector." } }
+                                        li { h3 { "Enter the connection details" } p { "Name it Artifact Board and paste the MCP server URL below. Choose OAuth sign-in and Register automatically for the OAuth client." } }
+                                        li { h3 { "Sign in and enable it" } p { "Connect with your work Microsoft account and approve access. In your chat, open + → Connectors and enable Artifact Board." } }
+                                    }
+                                    p { class: "agent-plan-note", "On Team or Enterprise, an owner may need to add the connector in Organization settings → Connectors first." }
+                                    a { class: "agent-guide-link", href: "https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp", target: "_blank", rel: "noopener noreferrer", "Claude connector guide ↗" }
+                                }
+                                div { "data-agent-guide": "chatgpt-web", hidden: true,
+                                    ol { class: "agent-help-steps",
+                                        li { h3 { "Add a custom MCP server" } p { "In ChatGPT, open Plugins → + → Add custom MCP server." } }
+                                        li { h3 { "Enter the connection details" } p { "Name it Artifact Board, paste the MCP server URL below, and choose OAuth with dynamic client registration (DCR). Leave client ID and secret empty." } }
+                                        li { h3 { "Connect and install" } p { "Create it as a plugin, complete your work Microsoft sign-in, and install it. In a new chat, type @ and select Artifact Board." } }
+                                    }
+                                    p { class: "agent-plan-note", "Your workspace must allow custom MCP plugins. Ask an admin if the add option is unavailable." }
+                                    a { class: "agent-guide-link", href: "https://chatgpt.com/plugins", target: "_blank", rel: "noopener noreferrer", "Open ChatGPT Plugins ↗" }
+                                    a { class: "agent-guide-link", href: "https://developers.openai.com/api/docs/guides/custom-mcp-server", target: "_blank", rel: "noopener noreferrer", "ChatGPT setup guide ↗" }
+                                }
+                                div { class: "agent-command agent-server-endpoint",
+                                    div { class: "agent-command-bar", span { "MCP SERVER URL" } button { class: "text-button", "data-copy-command": "agent-server-url", aria_label: "Copy MCP server URL", "Copy" } }
+                                    pre { code { id: "agent-server-url", "{mcp_url}" } }
+                                }
+                                div { class: "agent-help-prompt", span { "THEN TRY ASKING" } p { "“Publish this HTML file to Artifact Board and send me the review link.”" } }
+                                details { class: "agent-help-other",
+                                    summary { "Using another agent?" }
+                                    p { "Other desktop MCP clients can use the server URL above with OAuth browser sign-in and automatic client registration." }
+                                }
+                                div { class: "agent-help-links", a { href: "/oauth/connections", "Manage connected agents →" } }
+                            }
                             div { class: "supported", h3 { "Bring your own format" } p { span { "01" } "Static websites & mockups" } p { span { "02" } "Markdown documents" } p { span { "03" } "Complete React projects" } }
                             p { class: "fineprint", "Revisions change. The conversation stays." }
                         }
@@ -131,19 +213,37 @@ pub fn review(data: Value) -> String {
         &title,
         rsx! {
             div { id: "app", "data-page": "review", "data-boot": "{boot}",
-                header { class: "topbar review-topbar", Mark {} div { class: "review-title", strong { "{title}" } span { "Revision {short_revision}" } } button { id: "copy-review-link", class: "button secondary small", "Copy link ↗" } }
-                div { class: "review-toolbar", div { class: "tool-group", span { class: "live-dot" } span { "Review mode" } span { class: "toolbar-divider" } button { id: "select-element", class: "tool-button", aria_pressed: "false", "⊞ Select element" } button { id: "general-comment", class: "tool-button", "+ General comment" } } button { id: "toggle-discussion", class: "tool-button", "Discussion ☰" } }
                 main { class: "review-layout",
                     section { class: "canvas", aria_label: "Artifact preview",
-                        div { class: "canvas-chrome", span { class: "window-dots", "● ● ●" } span { "{title}" } span { "PREVIEW" } }
                         iframe { id: "artifact-frame", src: "{content_url}", title: "{title} preview", "sandbox": "allow-scripts", referrerpolicy: "no-referrer" }
                         div { id: "selection-action", class: "selection-action hidden", button { id: "comment-selection", class: "button primary small", "+ Comment on selection" } }
-                        p { id: "selection-hint", class: "canvas-hint", "Highlight text to leave feedback, or use Select element." }
                     }
-                    aside { class: "discussion", id: "discussion-panel", aria_label: "Discussion",
-                        div { class: "discussion-header", div { span { class: "eyebrow", "THE CONVERSATION" } h2 { "Discussion" span { id: "thread-count", class: "count", "0" } } } div { class: "tool-group", button { id: "refresh-discussion", class: "icon-button", aria_label: "Refresh discussion", title: "Refresh discussion", "↻" } button { id: "new-comment", class: "icon-button", aria_label: "New general comment", "+" } } }
-                        nav { class: "discussion-tabs", aria_label: "Discussion filter", button { class: "thread-filter active", "data-thread-filter": "open", "Open" } button { class: "thread-filter", "data-thread-filter": "unmatched", "Unmatched" } button { class: "thread-filter", "data-thread-filter": "resolved", "Resolved" } }
+                    aside { class: "discussion", id: "discussion-panel", aria_label: "Review panel", hidden: true,
+                        div { class: "review-panel-heading", div { span { class: "eyebrow", "REVIEW" } h2 { "{title}" } p { "Revision {short_revision}" } } button { id: "close-review", class: "icon-button", aria_label: "Close review panel", title: "Back to document (Escape)", "×" } }
+                        section { class: "revision-history", aria_label: "Revision history",
+                            label { r#for: "revision-picker", "Version history" }
+                            select { id: "revision-picker", aria_label: "View a revision" }
+                            div { id: "earlier-revision", hidden: true,
+                                p { "You’re viewing an earlier revision." }
+                                a { id: "latest-revision-link", href: "#", "Back to latest →" }
+                                if data["is_owner"] == true { button { id: "delete-revision", class: "text-button danger-text", "Delete this revision…" } }
+                            }
+                        }
+                        div { class: "review-panel-links", a { href: "/", "← My shares" } button { id: "copy-review-link", class: "text-button", "Copy link ↗" } }
+                        div { class: "review-panel-tools", button { id: "select-element", class: "tool-button", aria_pressed: "false", "⊞ Select element" } button { id: "general-comment", class: "tool-button", "+ General comment" } }
+                        div { class: "hide-review-control",
+                            button { id: "hide-review", class: "button secondary hide-review",
+                                svg { width: "16", height: "16", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.7", "aria-hidden": "true", path { d: "m3 3 18 18M10.6 10.6a2 2 0 0 0 2.8 2.8M9.9 5.2A12 12 0 0 1 12 5c6 0 10 7 10 7a17 17 0 0 1-3.5 4.1M6.1 6.1A20 20 0 0 0 2 12s4 7 10 7a12 12 0 0 0 5.9-1.6" } }
+                                "Hide review tools"
+                            }
+                            p { "Reload the page to show them again." }
+                        }
+                        p { id: "selection-hint", class: "review-panel-hint", "Highlight text in the page, or select an element." }
+                        div { class: "discussion-header", h2 { "Discussion" span { id: "thread-count", class: "count", "0" } } div { class: "tool-group", button { id: "refresh-discussion", class: "icon-button", aria_label: "Refresh discussion", title: "Refresh discussion", "↻" } button { id: "new-comment", class: "icon-button", aria_label: "New general comment", "+" } } }
+                        nav { class: "discussion-tabs", aria_label: "Discussion filter", button { class: "thread-filter active", "data-thread-filter": "open", "Open" } button { class: "thread-filter", "data-thread-filter": "unmatched", "Unmatched" } button { class: "thread-filter", "data-thread-filter": "resolved", "Resolved" } button { class: "thread-filter", "data-thread-filter": "archived", "Archived" } }
                         div { id: "thread-list", class: "thread-list", aria_live: "polite" }
+                        details { id: "comment-composer-panel", class: "comment-composer-panel",
+                            summary { "Leave a comment" }
                         form { id: "comment-form", class: "comment-composer",
                             div { class: "composer-heading", strong { id: "composer-label", "General feedback" } button { r#type: "button", id: "cancel-anchor", class: "text-button", "Clear" } }
                             p { id: "anchor-preview", class: "anchor-preview hidden" }
@@ -152,8 +252,35 @@ pub fn review(data: Value) -> String {
                             label { r#for: "comment-body", class: "sr-only", "Your feedback" } textarea { id: "comment-body", required: true, maxlength: "8000", rows: "3", placeholder: "What’s working? What could be better?" }
                             p { id: "comment-error", class: "form-error", role: "alert" } button { r#type: "submit", class: "button primary", "Post comment ↑" }
                         }
+                        }
                     }
                 }
+                aside { id: "review-intro", class: "review-intro", hidden: true, aria_labelledby: "review-intro-title",
+                    button { id: "close-review-intro", class: "icon-button review-intro-close", aria_label: "Dismiss comment introduction", "×" }
+                    span { class: "review-intro-eyebrow", "A QUICK HELLO" }
+                    h2 { id: "review-intro-title", "Your feedback goes here." }
+                    p { "Open comments with the button below. Highlight text or pick an element to comment on something specific." }
+                    div { class: "review-intro-actions",
+                        button { id: "show-review-intro", class: "button primary", "Show me" }
+                        button { id: "dismiss-review-intro", class: "text-button", "Got it" }
+                    }
+                }
+                button { id: "toggle-discussion", class: "review-launcher", aria_label: "Open review panel", aria_expanded: "false", aria_controls: "discussion-panel", title: "Review this document",
+                    svg { class: "review-launcher-icon", width: "22", height: "22", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.7", "aria-hidden": "true", path { d: "M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l-3 3V11.5A7.5 7.5 0 0 1 9.5 4h3A7.5 7.5 0 0 1 20 11.5Z" } path { d: "M7 10h8M7 14h5" } }
+                    span { id: "comment-count", class: "review-comment-count", hidden: true, aria_hidden: "true" }
+                    span { class: "review-launcher-label", "Review" }
+                    span { class: "review-launcher-close", aria_hidden: "true", "×" }
+                }
+                dialog { id: "review-confirm", class: "review-confirm", aria_labelledby: "review-confirm-title", aria_describedby: "review-confirm-message",
+                    h2 { id: "review-confirm-title" }
+                    p { id: "review-confirm-message" }
+                    p { id: "review-confirm-error", class: "form-error", role: "alert" }
+                    div { class: "review-confirm-actions",
+                        button { id: "review-confirm-cancel", class: "button secondary", "Cancel" }
+                        button { id: "review-confirm-submit", class: "button danger", "Delete" }
+                    }
+                }
+                div { id: "review-hidden-notice", class: "review-hidden-notice", hidden: true, role: "status", tabindex: "-1", "Comments hidden. Reload the page to reveal them again." }
                 div { id: "toast", class: "toast hidden", role: "status" }
             }
         },

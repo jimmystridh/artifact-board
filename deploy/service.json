@@ -1,0 +1,143 @@
+{
+  "apiVersion": "serving.knative.dev/v1",
+  "kind": "Service",
+  "metadata": {
+    "name": "artifact-board-pilot",
+    "namespace": "134099336412",
+    "labels": {
+      "app": "artifact-board",
+      "environment": "pilot"
+    },
+    "annotations": {
+      "run.googleapis.com/ingress": "all",
+      "run.googleapis.com/maxScale": "1"
+    }
+  },
+  "spec": {
+    "template": {
+      "metadata": {
+        "labels": {
+          "app": "artifact-board",
+          "environment": "pilot"
+        },
+        "annotations": {
+          "autoscaling.knative.dev/minScale": "0",
+          "autoscaling.knative.dev/maxScale": "1",
+          "run.googleapis.com/execution-environment": "gen2",
+          "run.googleapis.com/cpu-throttling": "true",
+          "run.googleapis.com/startup-cpu-boost": "false"
+        }
+      },
+      "spec": {
+        "serviceAccountName": "artifact-board-api@dev-innov-cm.iam.gserviceaccount.com",
+        "containerConcurrency": 10,
+        "timeoutSeconds": 300,
+        "containers": [
+          {
+            "image": "europe-north2-docker.pkg.dev/dev-innov-cm/cloud-run-source-deploy/artifact-board-pilot@sha256:5fb39fe6828fdbeaba245df8bc8b8bdde41b64605a51fbf92f104e03a824654b",
+            "ports": [
+              {
+                "containerPort": 8080
+              }
+            ],
+            "resources": {
+              "limits": {
+                "cpu": "1",
+                "memory": "512Mi"
+              }
+            },
+            "env": [
+              {
+                "name": "ARTIFACT_STORE",
+                "value": "firestore"
+              },
+              {
+                "name": "GOOGLE_CLOUD_PROJECT",
+                "value": "dev-innov-cm"
+              },
+              {
+                "name": "ARTIFACT_DATABASE",
+                "value": "artifact-board-pilot"
+              },
+              {
+                "name": "ARTIFACT_BUCKET",
+                "value": "dev-innov-cm-artifact-board-pilot"
+              },
+              {
+                "name": "ARTIFACT_ORIGIN",
+                "value": "https://artifact-board-pilot-134099336412.europe-north2.run.app"
+              },
+              {
+                "name": "ARTIFACT_NODE_BIN_DIR",
+                "value": "/usr/local/bin"
+              },
+              {
+                "name": "ARTIFACT_ENTRA_TENANT",
+                "value": "c166b9c4-5053-4eec-9665-aba0782d0804"
+              },
+              {
+                "name": "ARTIFACT_GATED_TENANT",
+                "value": "c166b9c4-5053-4eec-9665-aba0782d0804"
+              },
+              {
+                "name": "ARTIFACT_ENTRA_CLIENT_ID",
+                "value": "c7baacf9-7f62-40bb-8c51-fbd8d77507f3"
+              },
+              {
+                "name": "ARTIFACT_BUILD_JOB_NAME",
+                "value": "artifact-board-build"
+              },
+              {
+                "name": "ARTIFACT_BUILD_JOB_REGION",
+                "value": "europe-north2"
+              },
+              {
+                "name": "ARTIFACT_BUILD_JOB_CONTAINER",
+                "value": "worker"
+              },
+              {
+                "name": "ARTIFACT_BUILD_MODE",
+                "value": "container"
+              },
+              {
+                "name": "ARTIFACT_SLACK_DELIVERY_ENABLED",
+                "value": "false"
+              },
+              {
+                "name": "ARTIFACT_SESSION_KEY",
+                "valueFrom": {
+                  "secretKeyRef": {
+                    "name": "artifact-board-session-key",
+                    "key": "1"
+                  }
+                }
+              },
+              {
+                "name": "ARTIFACT_ENTRA_CLIENT_SECRET",
+                "valueFrom": {
+                  "secretKeyRef": {
+                    "name": "mcp-gateway-entra-client-secret",
+                    "key": "1"
+                  }
+                }
+              },
+              {
+                "name": "ARTIFACT_CONFIG_VERSION",
+                "value": "agent-clients-20261019-f4d771838204"
+              }
+            ],
+            "startupProbe": {
+              "httpGet": {
+                "path": "/health",
+                "port": 8080
+              },
+              "periodSeconds": 5,
+              "timeoutSeconds": 3,
+              "failureThreshold": 24
+            }
+          }
+        ]
+      }
+    }
+  }
+}

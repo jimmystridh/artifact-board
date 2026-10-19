@@ -81,6 +81,16 @@ fn valid_body(b: &str) -> Result<(), AppError> {
         Ok(())
     }
 }
+fn active_discussion(t: &Value) -> Result<(), AppError> {
+    if t["state"] == "archived" || t["state"] == "deleted" {
+        return Err(err(
+            409,
+            "discussion_state",
+            "Restore this discussion before replying or resolving it",
+        ));
+    }
+    Ok(())
+}
 fn actor(p: Option<&Principal>, name: Option<&str>) -> Result<(String, String, bool), AppError> {
     if let Some(p) = p {
         auth(p)?;
@@ -380,11 +390,26 @@ impl FirestoreCore {
         s["revisions"] = self.revisions(sid).await?;
         Ok(output(s, true))
     }
+    async fn revision_deleted(&self, rid: &str) -> Result<bool, AppError> {
+        let token = self.store.runtime_token().await?;
+        Ok(self
+            .store
+            .get(C::RevisionTombstones, rid, None, &token)
+            .await?
+            .is_some())
+    }
     async fn revisions(&self, sid: &str) -> Result<Value, AppError> {
+        let deleted = self
+            .query(C::RevisionTombstones, "share_id", &json!(sid))
+            .await?
+            .into_iter()
+            .map(|d| d.data["revision_id"].as_str().unwrap_or("").to_owned())
+            .collect::<BTreeSet<_>>();
         let mut rows = self
             .query(C::Revisions, "share_id", &json!(sid))
             .await?
             .into_iter()
+            .filter(|d| !deleted.contains(d.data["id"].as_str().unwrap_or("")))
             .map(|d| revision_output(&d.data))
             .collect::<Vec<_>>();
         rows.sort_by_key(|v| {
@@ -800,7 +825,7 @@ impl FirestoreCore {
                 if let Some(expected)=expected_latest&& s.data["latest_revision"].as_str()!=expected{return Err(err(409,"stale_build","A newer revision was published while this build was running"));}
                 if u.data["expires_at"].as_i64().unwrap_or(0)<now(){return Err(err(410,"expired_upload","Upload session expired"));}
                 let origins=tx.query(C::Threads,"share_id",&json!(sid)).await?;
-                let unresolved=origins.into_iter().filter(|t|t.data["resolved"]==false).collect::<Vec<_>>();
+                let unresolved=origins.into_iter().filter(|t|t.data["resolved"]==false && t.data["state"]!="archived" && t.data["state"]!="deleted").collect::<Vec<_>>();
                 if unresolved.len()>400{return Err(err(413,"placement_fanout_limit","Revision exceeds atomic placement limit of 400 unresolved threads"));}
                 for t in unresolved{
                     let tid=t.data["id"].as_str().unwrap();
@@ -842,7 +867,11 @@ impl FirestoreCore {
             )
             .await?
             .data;
-        if r["share_id"] != s["id"] {
+        if r["share_id"] != s["id"]
+            || self
+                .revision_deleted(r["id"].as_str().unwrap_or(""))
+                .await?
+        {
             return Err(err(404, "not_found", "Revision not found"));
         }
         Ok(r)
@@ -870,6 +899,7 @@ impl FirestoreCore {
             .query(C::Threads, "share_id", &s["id"])
             .await?
             .into_iter()
+            .filter(|d| d.data["state"] != "deleted")
             .map(|d| d.data)
             .collect::<Vec<_>>();
         threads.sort_by_key(|t| {
@@ -902,6 +932,13 @@ impl FirestoreCore {
         for c in &mut comments {
             c.as_object_mut().unwrap().remove("sequence");
         }
+        if t["state"].is_null() {
+            t["state"] = json!("active");
+        }
+        t["origin_deleted"] = json!(
+            self.revision_deleted(t["original_revision"].as_str().unwrap_or(""))
+                .await?
+        );
         t["comments"] = json!(comments);
         t["placements"] = json!(
             self.query(C::Placements, "thread_id", &t["id"])
@@ -976,6 +1013,8 @@ impl FirestoreCore {
                 let s = tx.view(cap, p).await?;
                 let sid = s.data["id"].as_str().unwrap();
                 if let Some(result) = tx.replay_comment(sid, "thread", receipt, &fingerprint).await? {
+                    let existing=tx.get(C::Threads,result["id"].as_str().unwrap_or("")).await?;
+                    active_discussion(&existing.data)?;
                     return Ok((tx, result));
                 }
                 valid_body(body)?;
@@ -984,11 +1023,11 @@ impl FirestoreCore {
                 }
                 let a = actor(p, guest_name)?;
                 let r = tx.get(C::Revisions, revision).await?;
-                if r.data["share_id"] != s.data["id"] {
+                if r.data["share_id"] != s.data["id"] || tx.maybe(C::RevisionTombstones,revision).await?.is_some() {
                     return Err(err(400, "invalid_revision", "Revision must belong to this share"));
                 }
                 let t = json!({"id":tid,"share_id":sid,"original_revision":revision,
-                    "original_anchor":anchor,"resolved":false,"created_at":now(),"comment_count":1});
+                    "original_anchor":anchor,"resolved":false,"state":"active","created_at":now(),"comment_count":1});
                 let comment = post(&mut tx, &s.data, &tid, &a, p, body, 1).await?;
                 tx.create(C::Threads, &tid, t.clone());
                 let mut result = t;
@@ -1047,6 +1086,10 @@ impl FirestoreCore {
                     .replay_comment(sid, "reply", receipt, &fingerprint)
                     .await?
                 {
+                    let existing = tx
+                        .get(C::Threads, result["id"].as_str().unwrap_or(""))
+                        .await?;
+                    active_discussion(&existing.data)?;
                     return Ok((tx, result));
                 }
                 valid_body(body)?;
@@ -1055,6 +1098,7 @@ impl FirestoreCore {
                 if t.data["share_id"] != s.data["id"] {
                     return Err(err(404, "not_found", "Thread not found"));
                 }
+                active_discussion(&t.data)?;
                 // Firestore reads do not see buffered writes: hydrate the committed snapshot,
                 // then append this transaction's exact comment before storing the receipt.
                 let mut result = tx.thread_snapshot(t.data.clone()).await?;
@@ -1095,6 +1139,7 @@ impl FirestoreCore {
                 if t.data["share_id"] != sid {
                     return Err(err(404, "not_found", "Thread not found"));
                 }
+                active_discussion(&t.data)?;
                 let mut next = t.data.clone();
                 next["resolved"] = json!(resolved);
                 tx.update(C::Threads, tid, &t, next.clone());
@@ -1103,6 +1148,62 @@ impl FirestoreCore {
             .await?;
         self.hydrate(&mut out).await?;
         Ok(out)
+    }
+    pub async fn delete_revision(
+        &self,
+        p: &Principal,
+        sid: &str,
+        rid: &str,
+    ) -> Result<Value, AppError> {
+        self.transact(|mut tx| async move {
+            let s = tx.get(C::Shares, sid).await?;
+            owner(p, &s.data)?;
+            writable(&s.data)?;
+            let r = tx.get(C::Revisions, rid).await?;
+            if r.data["share_id"] != sid {
+                return Err(err(404, "not_found", "Revision not found"));
+            }
+            if s.data["latest_revision"] == rid {
+                return Err(err(
+                    409,
+                    "latest_revision",
+                    "The latest revision cannot be deleted. Publish a new revision first.",
+                ));
+            }
+            if tx.maybe(C::RevisionTombstones, rid).await?.is_none() {
+                tx.create(
+                    C::RevisionTombstones,
+                    rid,
+                    json!({"share_id":sid,"revision_id":rid,"deleted_at":now()}),
+                );
+            }
+            Ok((tx, json!({"id":rid,"state":"deleted"})))
+        })
+        .await
+    }
+    pub async fn moderate_thread(
+        &self,
+        p: &Principal,
+        sid: &str,
+        tid: &str,
+        action: &str,
+    ) -> Result<Value, AppError> {
+        self.transact(|mut tx| async move {
+            let s = tx.get(C::Shares, sid).await?;
+            owner(p, &s.data)?;
+            writable(&s.data)?;
+            let t = tx.get(C::Threads, tid).await?;
+            if t.data["share_id"] != sid {
+                return Err(err(404, "not_found", "Thread not found"));
+            }
+            let state = t.data["state"].as_str().unwrap_or("active");
+            let next = crate::core::discussion_transition(state, action)?;
+            let mut value = t.data.clone();
+            value["state"] = json!(next);
+            tx.update(C::Threads, tid, &t, value);
+            Ok((tx, json!({"id":tid,"state":next})))
+        })
+        .await
     }
     pub async fn lifecycle(
         &self,

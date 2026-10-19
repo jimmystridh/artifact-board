@@ -1,0 +1,73 @@
+{
+  "apiVersion": "run.googleapis.com/v1",
+  "kind": "Job",
+  "metadata": {
+    "name": "artifact-board-notify",
+    "namespace": "134099336412",
+    "labels": {
+      "app": "artifact-board",
+      "environment": "pilot"
+    }
+  },
+  "spec": {
+    "template": {
+      "spec": {
+        "taskCount": 1,
+        "parallelism": 1,
+        "template": {
+          "spec": {
+            "serviceAccountName": "artifact-board-notify@dev-innov-cm.iam.gserviceaccount.com",
+            "maxRetries": 0,
+            "timeoutSeconds": "60",
+            "containers": [
+              {
+                "name": "worker",
+                "image": "europe-north2-docker.pkg.dev/dev-innov-cm/cloud-run-source-deploy/artifact-board-pilot@sha256:2a62fa5feddeaa9246c06552b9a9eff58a1f62132fbcb85e96708154f7fae6d8",
+                "resources": {
+                  "limits": {
+                    "cpu": "1",
+                    "memory": "512Mi"
+                  }
+                },
+                "env": [
+                  {
+                    "name": "ARTIFACT_STORE",
+                    "value": "firestore"
+                  },
+                  {
+                    "name": "GOOGLE_CLOUD_PROJECT",
+                    "value": "dev-innov-cm"
+                  },
+                  {
+                    "name": "ARTIFACT_DATABASE",
+                    "value": "artifact-board-pilot"
+                  },
+                  {
+                    "name": "ARTIFACT_BUCKET",
+                    "value": "dev-innov-cm-artifact-board-pilot"
+                  },
+                  {
+                    "name": "ARTIFACT_ORIGIN",
+                    "value": "https://artifact-board-pilot-134099336412.europe-north2.run.app"
+                  },
+                  {
+                    "name": "ARTIFACT_NODE_BIN_DIR",
+                    "value": "/usr/local/bin"
+                  },
+                  {
+                    "name": "ARTIFACT_NOTIFICATION_WORKER",
+                    "value": "1"
+                  },
+                  {
+                    "name": "ARTIFACT_SLACK_DELIVERY_ENABLED",
+                    "value": "false"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -55,24 +55,32 @@ const deferred = () => { let resolve; const promise = new Promise(done => { reso
 const storage = () => { const values = new Map(); return { values, getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, String(value)), removeItem: key => values.delete(key) }; };
 async function harness(initialThreads, fetcher, config = {}) {
  const body = new Element('body'), app = new Element(); app.id = 'app'; app.dataset.page = config.page || 'review'; app.dataset.boot = JSON.stringify({ capability: 'review-token', mutation_actor: 'guest:actor-1', revision: { id: 'revision-1' }, share: { id: 'share-1' }, can_manage: true, threads: initialThreads, ...config.boot }); body.append(app);
- const ids = ['guest-name', 'artifact-frame', 'anchor-preview', 'composer-label', 'selection-action', 'discussion-panel', 'comment-body', 'select-element', 'selection-hint', 'comment-selection', 'cancel-anchor', 'general-comment', 'new-comment', 'toggle-discussion', 'copy-review-link', 'thread-list', 'thread-count', 'refresh-discussion', 'comment-form', 'comment-error', 'toast', 'sign-out', 'upload-dialog', 'upload-form', 'publish-button', 'upload-title', 'artifact-title', 'artifact-kind', 'artifact-policy', 'entrypoint', 'artifact-files', 'file-summary', 'upload-progress', 'upload-error', 'new-share', 'close-upload', 'policy-field', 'policy-summary', 'share-search', 'no-results'];
+ const ids = ['agent-client','comment-composer-panel','revision-picker','earlier-revision','latest-revision-link','delete-revision','review-confirm','review-confirm-title','review-confirm-message','review-confirm-error','review-confirm-cancel','review-confirm-submit','hide-review', 'comment-count', 'review-hidden-notice', 'review-intro', 'show-review-intro', 'dismiss-review-intro', 'close-review-intro', 'guest-name', 'artifact-frame', 'anchor-preview', 'composer-label', 'selection-action', 'discussion-panel', 'comment-body', 'select-element', 'selection-hint', 'comment-selection', 'cancel-anchor', 'general-comment', 'new-comment', 'toggle-discussion', 'close-review', 'copy-review-link', 'thread-list', 'thread-count', 'refresh-discussion', 'comment-form', 'comment-error', 'toast', 'sign-out', 'upload-dialog', 'upload-form', 'publish-button', 'upload-title', 'artifact-title', 'artifact-kind', 'artifact-policy', 'entrypoint', 'artifact-files', 'file-summary', 'upload-progress', 'upload-error', 'new-share', 'close-upload', 'policy-field', 'policy-summary', 'share-search', 'no-results'];
  ids.forEach(id => { const node = new Element(id === 'comment-form' ? 'form' : id === 'comment-body' ? 'textarea' : 'div'); node.id = id; app.append(node); });
  const identity = new Element('p'); identity.className = 'identity-note'; app.append(identity);
  const filters = {};
- for (const name of ['open', 'resolved', 'unmatched']) { const button = new Element('button'); button.dataset.threadFilter = name; app.append(button); filters[name] = button; }
+ for (const name of ['open', 'resolved', 'unmatched', 'archived']) { const button = new Element('button'); button.dataset.threadFilter = name; app.append(button); filters[name] = button; }
  const $ = selector => body.querySelector(selector);
- $('#guest-name').value = 'Guest'; $('#artifact-frame').contentWindow = { postMessage() {} };
+ $('#review-hidden-notice').hidden = true; $('#review-intro').hidden = true; $('#guest-name').value = 'Guest'; const bridgeMessages=[]; $('#artifact-frame').contentWindow = { postMessage(data) { bridgeMessages.push(data); } };
  const submit = new Element('button'); submit.type = 'submit'; $('#comment-form').append(submit);
  const document = { querySelector: $, querySelectorAll: selector => body.querySelectorAll(selector), getElementById: id => $(`#${id}`), createElement: tag => new Element(tag), addEventListener() {} };
- const calls = [], sessionStorage = config.storage || storage(); let reloads = 0;
+ const keyListeners = {}; document.addEventListener = (type, listener) => { keyListeners[type] = listener; };
+ const calls = [], sessionStorage = config.storage || storage(), localStorage = config.localStorage || storage(), timers = []; let reloads = 0;
  $('#artifact-files').files = [];
- const context = { document, sessionStorage, TextEncoder, URL, AbortSignal, window: { addEventListener() {} }, crypto: webcrypto, fetch: async (url, options = {}) => { const call = { url: String(url), method: options.method || 'GET', body: typeof options.body === 'string' ? JSON.parse(options.body) : options.body }; calls.push(call); return fetcher(call); }, location: { origin: 'http://localhost', href: 'http://localhost/s/review-token', reload() { reloads++; } }, navigator: {}, setTimeout: () => 1, clearTimeout() {}, matchMedia: () => ({ matches: false }), console };
+ if(app.dataset.page==='dashboard'){
+  $('#agent-client').value='codex';for(const client of ['codex','claude-code','claude-web','chatgpt-web']){const guide=new Element('div');guide.dataset.agentGuide=client;app.append(guide)}
+  for(const [id,command] of [['agent-add-command','codex mcp add artifact-board --url https://example.invalid/mcp'],['agent-login-command','codex mcp login artifact-board'],['agent-server-url','https://example.invalid/mcp'],['agent-claude-command','claude mcp add --transport http --scope user artifact-board https://example.invalid/mcp'],['agent-claude-login','/mcp']]){
+   const code=new Element('code');code.id=id;code.textContent=command;app.append(code);
+   const button=new Element('button');button.id='copy-'+id;button.dataset.copyCommand=id;app.append(button);
+  }
+ }
+ const windowListeners={}; const context = { Date:config.now?class extends Date{static now(){return config.now()}}:Date, document, sessionStorage, localStorage, TextEncoder, URL, AbortSignal, window: { addEventListener(type,listener) {windowListeners[type]=listener;} }, crypto: webcrypto, fetch: async (url, options = {}) => { const call = { url: String(url), method: options.method || 'GET', body: typeof options.body === 'string' ? JSON.parse(options.body) : options.body }; calls.push(call); return fetcher(call); }, location: { origin: 'http://localhost', href: 'http://localhost/s/review-token', reload() { reloads++; } }, navigator: {clipboard:config.clipboard}, setTimeout: (callback, ms) => { timers.push({ callback, ms }); return timers.length; }, clearTimeout(id) { if(timers[id-1])timers[id-1].callback=null; }, matchMedia: () => ({ matches: false }), console };
  await vm.runInNewContext(source, context, { timeout: 1000 });
  const card = id => $('#thread-list').querySelectorAll('.thread-card').find(node => node.dataset.id === id);
  const action = (id, label) => card(id).querySelectorAll('button').find(node => node.textContent === label);
  const openReply = id => { action(id, 'Reply').onclick(); return card(id).querySelector('.reply-form'); };
  const submitReply = id => card(id).querySelector('.reply-form').onsubmit({ preventDefault() {} });
- return { $, filters, calls, card, action, openReply, submitReply, storage: sessionStorage, get reloads() { return reloads; }, submitComment: () => $('#comment-form').onsubmit({ preventDefault() {}, target: $('#comment-form') }), submitUpload: () => $('#upload-form').onsubmit({ preventDefault() {} }) };
+ return { $, filters, calls, location:context.location, bridgeMessages, bridge(data,source=$('#artifact-frame').contentWindow){windowListeners.message({source,data:{source:'artifact-bridge',nonce:bridgeMessages[0].nonce,...data}})}, keyListeners, localStorage, runTimers(ms) { for(const timer of [...timers])if(timer.ms===ms&&timer.callback){const callback=timer.callback;timer.callback=null;callback();} }, card, action, openReply, submitReply, storage: sessionStorage, get reloads() { return reloads; }, submitComment: () => $('#comment-form').onsubmit({ preventDefault() {}, target: $('#comment-form') }), submitUpload: () => $('#upload-form').onsubmit({ preventDefault() {} }) };
 }
 
 test('a saved reply is reconciled from POST without a fallible follow-up GET or duplicate retry', async () => {
@@ -460,4 +468,174 @@ test('busy or unconfirmed trusted-host build failures retain the frozen finalize
  const third=await dashboard(()=>response(status),{storage:store}); await new Promise(resolve=>setImmediate(resolve));
  assert.ok(recoveryStates(store)[0].build); assert.equal(third.reloads,0);
  }
+});
+
+
+test('closing the review dock restores document mode without losing reply or comment drafts', async () => {
+ const h = await harness([thread('one')], () => response([]));
+ h.$('#toggle-discussion').onclick();
+ assert.equal(h.$('#discussion-panel').hidden, false);
+ assert.equal(h.$('#toggle-discussion').getAttribute('aria-expanded'), 'true');
+ h.openReply('one').querySelector('textarea').value = 'An unfinished reply';
+ write(h.$('#comment-body'), 'An unfinished comment');
+ h.$('#close-review').onclick();
+ assert.equal(h.$('#discussion-panel').hidden, true);
+ assert.equal(h.$('#toggle-discussion').getAttribute('aria-expanded'), 'false');
+ assert.equal(h.$('#toggle-discussion').focused, true);
+ h.$('#toggle-discussion').onclick();
+ assert.equal(h.card('one').querySelector('textarea').value, 'An unfinished reply');
+ assert.equal(h.$('#comment-body').value, 'An unfinished comment');
+ assert.equal(h.calls.length, 0);
+});
+
+test('Escape closes the review dock and returns keyboard focus to its launcher', async () => {
+ const h = await harness([], () => response([]));
+ h.$('#toggle-discussion').onclick();
+ h.keyListeners.keydown({key:'Escape'});
+ assert.equal(h.$('#discussion-panel').hidden, true);
+ assert.equal(h.$('#toggle-discussion').focused, true);
+ assert.match(h.$('#toggle-discussion').getAttribute('aria-label'), /^Open review panel/);
+});
+
+
+test('first-visit introduction appears without opening the panel and dismissal persists across documents', async () => {
+ const localStorage=storage(), first=await harness([],()=>response([]),{localStorage});
+ assert.equal(first.$('#review-intro').hidden,true);
+ first.runTimers(1200);
+ assert.equal(first.$('#review-intro').hidden,false);
+ assert.notEqual(first.$('#toggle-discussion').focused,true);
+ assert.notEqual(first.$('#discussion-panel').hidden,false);
+ first.$('#dismiss-review-intro').onclick();
+ assert.equal(first.$('#review-intro').hidden,true);
+ assert.equal(first.$('#toggle-discussion').focused,true);
+ const next=await harness([],()=>response([]),{localStorage,boot:{share:{id:'another-share'}}});
+ next.runTimers(1200);assert.equal(next.$('#review-intro').hidden,true);
+});
+
+test('Show me opens the review panel and acknowledges the introduction', async () => {
+ const h=await harness([],()=>response([]));h.runTimers(1200);h.$('#show-review-intro').onclick();
+ assert.equal(h.$('#review-intro').hidden,true);assert.equal(h.$('#discussion-panel').hidden,false);
+ assert.equal(h.$('#close-review').focused,true);assert.equal(h.localStorage.getItem('artifact-board:review-intro:v1'),'seen');
+});
+
+test('opening comments before the introduction delay cancels it', async () => {
+ const h=await harness([],()=>response([]));h.$('#toggle-discussion').onclick();h.$('#close-review').onclick();h.runTimers(1200);
+ assert.equal(h.$('#review-intro').hidden,true);assert.equal(h.$('#discussion-panel').hidden,true);
+});
+
+test('introduction supports Escape and still works when local storage is unavailable', async () => {
+ const localStorage={getItem(){throw Error('blocked')},setItem(){throw Error('blocked')}};
+ const h=await harness([],()=>response([]),{localStorage});h.runTimers(1200);assert.equal(h.$('#review-intro').hidden,false);
+ h.keyListeners.keydown({key:'Escape'});assert.equal(h.$('#review-intro').hidden,true);assert.equal(h.$('#toggle-discussion').focused,true);
+ h.$('#toggle-discussion').onclick();assert.equal(h.$('#discussion-panel').hidden,false);
+});
+
+
+test('agent setup copies exact commands and the MCP URL without altering them', async () => {
+ const copied=[];const h=await dashboard(()=>response([]),{clipboard:{writeText:async text=>copied.push(text)}});
+ for(const id of ['agent-add-command','agent-login-command','agent-server-url'])await h.$('#copy-'+id).onclick();
+ assert.deepEqual(copied,['codex mcp add artifact-board --url https://example.invalid/mcp','codex mcp login artifact-board','https://example.invalid/mcp']);
+ assert.equal(h.$('#toast').textContent,'Copied to clipboard');
+});
+
+test('agent setup provides a manual copy fallback when clipboard permission is denied', async () => {
+ const h=await dashboard(()=>response([]),{clipboard:{writeText:async()=>{throw Error('denied')}}});
+ await h.$('#copy-agent-add-command').onclick();
+ assert.match(h.$('#toast').textContent,/Select the text and copy it/);
+ assert.equal(h.$('#agent-add-command').textContent,'codex mcp add artifact-board --url https://example.invalid/mcp');
+});
+
+const positionAnchor=()=>({kind:'general',path:'docs/index.html',element_id:'chapter',selector:'#chapter',position:{x:0,y:900,hash:'#chapter',scrolls:[{selector:'#reader',top:600,left:0}]},algorithm_version:1});
+test('launcher counts individual comments, including replies, and markers survive closing the panel',async()=>{
+ const one=thread('one');one.comments.push({id:'reply',body:'Second'});one.original_anchor={kind:'element',element_id:'chapter'};
+ const h=await harness([one,thread('two')],()=>response([]));h.bridge({type:'ready'});
+ assert.equal(h.$('#comment-count').textContent,'3');assert.equal(h.$('#comment-count').hidden,false);assert.match(h.$('#toggle-discussion').getAttribute('aria-label'),/3 comments/);
+ let batch=h.bridgeMessages.findLast(m=>m.type==='placements');assert.equal(batch.threads.length,2);assert.equal(batch.threads[0].count,2);
+ h.$('#toggle-discussion').onclick();h.$('#close-review').onclick();assert.equal(h.bridgeMessages.findLast(m=>m.type==='placements').threads.length,2);
+});
+test('hide disables every review surface until a new page load, preserving drafts',async()=>{
+ const h=await harness([thread('one')],()=>response([]));h.bridge({type:'ready'});h.$('#toggle-discussion').onclick();h.$('#comment-body').value='Keep my draft';h.$('#comment-body').oninput();h.$('#hide-review').onclick();
+ assert.equal(h.$('#toggle-discussion').hidden,true);assert.equal(h.$('#discussion-panel').hidden,true);assert.equal(h.$('#review-intro').hidden,true);assert.match(h.$('#review-hidden-notice').textContent||'Reload the page to reveal them again',/Reload the page/);assert.equal(h.bridgeMessages.at(-1).type,'disable');
+ h.bridge({type:'focus-thread',id:'one'});h.runTimers(1200);assert.equal(h.$('#discussion-panel').hidden,true);assert.equal(h.$('#review-intro').hidden,true);
+ h.bridge({type:'ready'});assert.equal(h.bridgeMessages.at(-1).type,'disable');
+ const reloaded=await harness([],()=>response([]),{storage:h.storage});assert.notEqual(reloaded.$('#toggle-discussion').hidden,true);assert.equal(reloaded.$('#comment-body').value,'Keep my draft');
+});
+test('general comments retain a captured document position across a lost acknowledgement and jump back from the list',async()=>{
+ let attempt=0;const h=await harness([],call=>{if(++attempt===1)return failure('Lost acknowledgement');const saved=thread('position',call.body.body);saved.original_anchor=call.body.anchor;return mutationResponse(call,saved)});
+ h.bridge({type:'ready'});h.bridge({type:'position',anchor:positionAnchor()});h.$('#general-comment').onclick();h.$('#comment-body').value='Here in chapter two';await h.submitComment();
+ const original=structuredClone(h.calls[0].body);assert.equal(original.anchor.position.y,900);
+ h.bridge({type:'position',anchor:{...positionAnchor(),position:{...positionAnchor().position,y:5000}}});await h.submitComment();assert.deepEqual(h.calls[1].body,original);
+ h.card('position').querySelector('.thread-anchor').onclick();assert.equal(h.bridgeMessages.at(-1).type,'focus');assert.equal(h.bridgeMessages.at(-1).anchor.position.y,900);
+});
+test('general position hints are source-bound and never placed on a newer revision',async()=>{
+ const prior=thread('prior');prior.original_revision='older';prior.original_anchor=positionAnchor();const h=await harness([prior],()=>response([]));h.bridge({type:'ready'});
+ assert.equal(h.bridgeMessages.findLast(m=>m.type==='placements').threads.length,0);
+ h.bridge({type:'position',anchor:positionAnchor()},{});h.$('#general-comment').onclick();assert.equal(h.$('#anchor-preview').textContent,'');
+ h.bridge({type:'position',anchor:{...positionAnchor(),position:{y:Infinity}}});h.$('#general-comment').onclick();assert.equal(h.$('#anchor-preview').textContent,'');
+});
+
+test('archived discussions are browseable but excluded from launcher and document markers',async()=>{
+ const archived={...thread('archive'),state:'archived'};archived.comments.push({id:'reply',body:'Archived reply'});const deleted={...thread('deleted'),state:'deleted'};
+ const h=await harness([thread('active'),archived,deleted],()=>response([]));h.bridge({type:'ready'});
+ assert.equal(h.$('#comment-count').textContent,'1');assert.equal(h.card('archive'),undefined);assert.equal(h.card('deleted'),undefined);assert.deepEqual(Array.from(h.bridgeMessages.findLast(m=>m.type==='placements').threads,t=>t.id),['active']);
+ h.filters.archived.onclick();assert.ok(h.card('archive'));assert.equal(h.action('archive','Reply').hidden,true);assert.ok(h.action('archive','Restore'));assert.ok(h.action('archive','Delete…'));assert.equal(h.$('#comment-count').textContent,'1');
+});
+test('archiving and restoring update counts immediately from acknowledgement without a refresh',async()=>{
+ const one=thread('one');one.comments.push({id:'reply',body:'Second'});const h=await harness([one],call=>response({id:'one',state:call.body.action==='archive'?'archived':'active'}));
+ await h.action('one','Archive').onclick();assert.equal(h.$('#comment-count').hidden,true);assert.equal(h.card('one'),undefined);
+ h.filters.archived.onclick();await h.action('one','Restore').onclick();assert.equal(h.$('#comment-count').textContent,'2');assert.equal(h.card('one'),undefined);assert.equal(h.calls.length,2);assert.ok(h.calls.every(c=>c.method==='POST'));
+});
+test('deleting an archived discussion requires confirmation and removes it from all filters',async()=>{
+ const h=await harness([{...thread('one'),state:'archived'}],()=>response({id:'one',state:'deleted'}));h.filters.archived.onclick();h.action('one','Delete…').onclick();assert.equal(h.calls.length,0);assert.equal(h.$('#review-confirm').open,true);assert.match(h.$('#review-confirm-message').textContent,/all its replies/);
+ h.$('#review-confirm-cancel').onclick();assert.equal(h.calls.length,0);h.action('one','Delete…').onclick();await h.$('#review-confirm-submit').onclick();assert.equal(h.card('one'),undefined);assert.equal(h.$('#review-confirm').open,false);assert.equal(h.$('#comment-count').hidden,true);
+});
+test('revision navigation exposes earlier versions and owner deletion goes back to latest only after acknowledgement',async()=>{
+ const boot={is_owner:true,share:{id:'share-1',latest_revision:'revision-2',revisions:[{id:'revision-1',created_at:1},{id:'revision-2',created_at:2}]}};
+ const h=await harness([],()=>response({id:'revision-1',state:'deleted'}),{boot});assert.equal(h.$('#revision-picker').children.length,2);assert.match(h.$('#revision-picker').children[1].textContent,/Latest/);assert.equal(h.$('#earlier-revision').hidden,false);
+ h.$('#delete-revision').onclick();assert.equal(h.calls.length,0);await h.$('#review-confirm-submit').onclick();assert.match(h.calls[0].url,/revisions\/revision-1\/delete$/);assert.equal(h.location.href,'/s/review-token');
+ const viewer=await harness([],()=>response({}),{boot:{...boot,is_owner:false,can_manage:false}});assert.equal(viewer.$('#delete-revision').onclick,undefined);viewer.$('#revision-picker').value='revision-2';viewer.$('#revision-picker').onchange();assert.equal(viewer.location.href,'/s/review-token');
+});
+test('failed deletion stays reviewable in the dialog and does not navigate or discard comments',async()=>{
+ const h=await harness([{...thread('one'),state:'archived'}],()=>failure('Try again'));h.filters.archived.onclick();h.action('one','Delete…').onclick();await h.$('#review-confirm-submit').onclick();assert.ok(h.card('one'));assert.equal(h.$('#review-confirm').open,true);assert.match(h.$('#review-confirm-error').textContent,/Try again/);assert.equal(h.$('#review-confirm-submit').disabled,false);
+});
+
+test('composer makes room for discussion, opens for new comments, and preserves restored drafts',async()=>{
+ const h=await harness([],()=>response([]));assert.equal(h.$('#comment-composer-panel').open,false);h.$('#general-comment').onclick();assert.equal(h.$('#comment-composer-panel').open,true);h.$('#comment-body').value='Keep my thought';h.$('#comment-body').oninput();
+ const restored=await harness([],()=>response([]),{storage:h.storage});assert.equal(restored.$('#comment-composer-panel').open,true);assert.equal(restored.$('#comment-body').value,'Keep my thought');
+});
+
+test('an older refresh cannot restore an archived discussion to the active count',async()=>{
+ const pending=deferred(),one=thread('one'),h=await harness([one],call=>call.method==='GET'?pending.promise:response({id:'one',state:'archived'}));
+ const refresh=h.$('#refresh-discussion').onclick();await h.action('one','Archive').onclick();pending.resolve(response([one]));await refresh;
+ assert.equal(h.$('#comment-count').hidden,true);assert.equal(h.card('one'),undefined);h.filters.archived.onclick();assert.ok(h.card('one'));
+});
+
+test('Escape in a deletion dialog leaves the underlying review panel open',async()=>{
+ const h=await harness([{...thread('one'),state:'archived'}],()=>response({}));h.$('#toggle-discussion').onclick();h.filters.archived.onclick();h.action('one','Delete…').onclick();h.keyListeners.keydown({key:'Escape'});assert.equal(h.$('#discussion-panel').hidden,false);
+});
+
+test('viewing an earlier version describes later discussion origins without reversing their chronology',async()=>{
+ const later={...thread('later'),original_revision:'revision-2'};const h=await harness([later],()=>response([]));assert.match(h.card('later').textContent,/From another revision/);assert.doesNotMatch(h.card('later').textContent,/From an earlier revision/);assert.equal(h.card('later').querySelector('a').href,'/s/review-token?revision=revision-2');
+});
+
+test('comments and replies show relative recent times and exact accessible timestamps',async()=>{
+ const now=Date.UTC(2026,9,19,12,0),one=thread('one');one.comments=[{id:'a',body:'New',created_at:(now-20000)/1000},{id:'b',body:'Minutes',created_at:(now-5*60000)/1000},{id:'c',body:'Hours',created_at:(now-3*3600000)/1000}];
+ const h=await harness([one],()=>response([]),{now:()=>now}),times=h.card('one').querySelectorAll('time');assert.equal(times.length,3);assert.deepEqual(times.map(t=>t.textContent),['Just now','5 minutes ago','3 hours ago']);assert.equal(times[1].dateTime,'2026-10-19T11:55:00.000Z');assert.match(times[1].title,/2026/);assert.match(times[1].getAttribute('aria-label'),/5 minutes ago/);
+});
+test('older and future comments use absolute dates, and missing timestamps are not invented',async()=>{
+ const now=Date.UTC(2026,9,19,12,0),created=now-2*86400000,one=thread('one');one.comments=[{id:'a',body:'Older',created_at:created/1000},{id:'b',body:'Future clock',created_at:(now+3600000)/1000},{id:'c',body:'No date'},{id:'d',body:'Invalid',created_at:1e30}];
+ const h=await harness([one],()=>response([]),{now:()=>now}),times=h.card('one').querySelectorAll('time');assert.equal(times.length,2);assert.equal(times[0].textContent,new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(new Date(created)));assert.doesNotMatch(times[1].textContent,/ago|Just now/);
+});
+test('relative timestamps age in place without losing comment drafts and stop when reviewing is disabled',async()=>{
+ let now=Date.UTC(2026,9,19,12,0);const one=thread('one');one.comments[0].created_at=(now-59000)/1000;const h=await harness([one],()=>response([]),{now:()=>now}),stamp=h.card('one').querySelector('time');h.$('#comment-body').value='Draft stays';h.$('#comment-body').oninput();
+ now+=60000;h.runTimers(60000);assert.equal(stamp.textContent,'1 minute ago');assert.equal(h.$('#comment-body').value,'Draft stays');now+=86400000;h.runTimers(60000);assert.doesNotMatch(stamp.textContent,/ago|Just now/);
+ const previous=stamp.textContent;h.$('#hide-review').onclick();now+=86400000;h.runTimers(60000);assert.equal(stamp.textContent,previous);
+});
+
+test('agent selector shows exactly one guide while preserving the shared endpoint',async()=>{
+ const h=await dashboard(()=>response([]));
+ for(const client of ['codex','claude-code','claude-web','chatgpt-web']){h.$('#agent-client').value=client;h.$('#agent-client').onchange();const guides=h.$('#app').querySelectorAll('[data-agent-guide]');assert.equal(guides.filter(g=>!g.hidden).length,1);assert.equal(guides.find(g=>!g.hidden).dataset.agentGuide,client);assert.equal(h.$('#agent-server-url').textContent,'https://example.invalid/mcp')}
+});
+test('Claude Code setup copies the literal shell and in-session commands',async()=>{
+ const copied=[],h=await dashboard(()=>response([]),{clipboard:{writeText:async value=>copied.push(value)}});await h.$('#copy-agent-claude-command').onclick();await h.$('#copy-agent-claude-login').onclick();assert.deepEqual(copied,['claude mcp add --transport http --scope user artifact-board https://example.invalid/mcp','/mcp']);
 });

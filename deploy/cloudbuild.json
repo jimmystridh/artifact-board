@@ -1,0 +1,28 @@
+{
+  "steps": [
+    {
+      "name": "gcr.io/cloud-builders/docker",
+      "args": [
+        "build",
+        "--platform",
+        "linux/amd64",
+        "-t",
+        "${_IMAGE}",
+        "."
+      ],
+      "env": [
+        "DOCKER_BUILDKIT=1"
+      ]
+    }
+  ],
+  "images": [
+    "${_IMAGE}"
+  ],
+  "timeout": "1200s",
+  "options": {
+    "machineType": "E2_HIGHCPU_8",
+    "logging": "GCS_ONLY"
+  },
+  "logsBucket": "gs://dev-innov-cm-artifact-board-pilot-build-logs",
+  "serviceAccount": "projects/dev-innov-cm/serviceAccounts/artifact-board-image-builder@dev-innov-cm.iam.gserviceaccount.com"
+}

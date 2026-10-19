@@ -367,7 +367,7 @@ async fn comment_retry_case(mut t: Test, cloud: bool) {
     let cookie = cookie.unwrap();
     let actor = identity["mutation_actor"].as_str().unwrap();
     let url = format!("/api/view/{cap}/threads");
-    let request = json!({"mutation_actor":actor,"idempotency_key":"lost-thread-response","guest_name":"Same display name","body":"Only one original","revision":revision["revision_id"],"anchor":{"kind":"general"}});
+    let request = json!({"mutation_actor":actor,"idempotency_key":"lost-thread-response","guest_name":"Same display name","body":"Only one original","revision":revision["revision_id"],"anchor":{"kind":"general","path":"index.html","element_id":"chapter","selector":"#chapter","position":{"x":0,"y":900,"hash":"#chapter","scrolls":[{"selector":"#reader","top":450,"left":0}]}}});
     assert_eq!(t.req("POST", &url, "", request.clone()).await.0, 409);
     assert_eq!(
         t.req("POST", &url, "artifact_guest=tampered", request.clone())
@@ -377,6 +377,7 @@ async fn comment_retry_case(mut t: Test, cloud: bool) {
     );
     let first = t.req("POST", &url, &cookie, request.clone()).await;
     assert_eq!(first.0, 200, "{}", first.1);
+    assert_eq!(first.1["original_anchor"], request["anchor"]);
     // Simulate lost mutation acknowledgement by retrying without consuming its result.
     let (a, b) = tokio::join!(
         t.req("POST", &url, &cookie, request.clone()),
@@ -447,4 +448,242 @@ async fn comment_retry_case(mut t: Test, cloud: bool) {
     );
     assert_eq!(t.req("POST", &reply_url, &cookie, reply).await.0, 404);
     assert_eq!(t.req("POST", &url, &cookie, request).await.0, 404);
+}
+
+#[tokio::test]
+async fn revision_history_and_discussion_lifecycle() {
+    history_case(Test::new(true)).await;
+}
+#[tokio::test]
+#[ignore = "requires real local Firestore emulator and fake GCS"]
+async fn firestore_revision_history_and_discussion_lifecycle() {
+    history_case(Test::cloud()).await;
+}
+async fn history_case(t: Test) {
+    let owner = t.login("owner").await;
+    let reviewer = t.login("reviewer").await;
+    let (share, first) = t.publish(&owner, "link-only").await;
+    let sid = share["id"].as_str().unwrap();
+    let cap = share["capability"].as_str().unwrap();
+    let rid = first["revision_id"].as_str().unwrap();
+    let endpoint = format!("/api/view/{cap}/threads");
+    let payload = json!({"body":"Original discussion","revision":rid,"anchor":{"kind":"general"},"idempotency_key":"history-thread","mutation_actor":"auth:dev-owner"});
+    let (_, thread, _) = t.req("POST", &endpoint, &owner, payload.clone()).await;
+    let tid = thread["id"].as_str().unwrap();
+    let reply_url = format!("{endpoint}/{tid}/replies");
+    let reply = json!({"body":"A reply","idempotency_key":"history-reply","mutation_actor":"auth:dev-owner"});
+    assert_eq!(
+        t.req("POST", &reply_url, &owner, reply.clone()).await.0,
+        200
+    );
+    let lifecycle = format!("/api/shares/{sid}/threads/{tid}/lifecycle");
+    assert_eq!(
+        t.req("POST", &lifecycle, &reviewer, json!({"action":"archive"}))
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        t.req("POST", &lifecycle, "", json!({"action":"archive"}))
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        t.req("POST", &lifecycle, &owner, json!({"action":"delete"}))
+            .await
+            .0,
+        409
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            t.req("POST", &lifecycle, &owner, json!({"action":"archive"}))
+                .await
+                .0,
+            200
+        );
+    }
+    let (_, archived, _) = t.req("GET", &endpoint, "", json!({})).await;
+    assert_eq!(archived[0]["state"], "archived");
+    assert_eq!(archived[0]["comments"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        t.req("POST", &reply_url, &owner, reply.clone()).await.0,
+        409
+    );
+    assert_eq!(
+        t.req("POST", &endpoint, &owner, payload.clone()).await.0,
+        409
+    );
+    assert_eq!(
+        t.req("POST", &lifecycle, &owner, json!({"action":"restore"}))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        t.req("POST", &reply_url, &owner, reply.clone()).await.0,
+        200
+    );
+    let (_, upload, _) = t
+        .req(
+            "POST",
+            &format!("/api/shares/{sid}/uploads"),
+            &owner,
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        t.req(
+            "PUT",
+            upload["upload_url"].as_str().unwrap(),
+            &owner,
+            json!({"files":[{"path":"index.html","content":"<h1>New revision</h1>"}]})
+        )
+        .await
+        .0,
+        200
+    );
+    let (_,latest,_)=t.req("POST",&format!("/api/uploads/{}/finalize",upload["id"].as_str().unwrap()),&owner,json!({"entrypoint":"index.html","idempotency_key":"history-finalize","mutation_actor":"auth:dev-owner"})).await;
+    let latest_id = latest["revision_id"].as_str().unwrap();
+    let delete = format!("/api/shares/{sid}/revisions/{rid}/delete");
+    assert_eq!(t.req("POST", &delete, &reviewer, json!({})).await.0, 403);
+    assert_eq!(
+        t.req(
+            "POST",
+            &format!("/api/shares/{sid}/revisions/{latest_id}/delete"),
+            &owner,
+            json!({})
+        )
+        .await
+        .0,
+        409
+    );
+    let (_, old_page, _) = t
+        .req(
+            "GET",
+            &format!("/s/{cap}?revision={rid}"),
+            &owner,
+            json!({}),
+        )
+        .await;
+    let old_html = old_page["html"].as_str().unwrap();
+    let frame = old_html
+        .split("src=\"")
+        .find(|s| s.starts_with("/frame/"))
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap()
+        .replace("&amp;", "&");
+    for _ in 0..2 {
+        assert_eq!(t.req("POST", &delete, &owner, json!({})).await.0, 200);
+    }
+    assert_eq!(
+        t.req(
+            "GET",
+            &format!("/s/{cap}?revision={rid}"),
+            &owner,
+            json!({})
+        )
+        .await
+        .0,
+        404
+    );
+    assert_eq!(
+        t.req(
+            "GET",
+            &format!("/content/{cap}/{rid}/index.html"),
+            &owner,
+            json!({})
+        )
+        .await
+        .0,
+        404
+    );
+    assert_eq!(t.req("GET", &frame, "", json!({})).await.0, 404);
+    assert_eq!(
+        t.req("GET", &format!("/s/{cap}"), "", json!({})).await.0,
+        200
+    );
+    let (_, detail, _) = t
+        .req("GET", &format!("/api/shares/{sid}"), &owner, json!({}))
+        .await;
+    assert_eq!(detail["revisions"].as_array().unwrap().len(), 1);
+    assert_eq!(detail["latest_revision"], latest_id);
+    let (_, threads, _) = t.req("GET", &endpoint, "", json!({})).await;
+    assert_eq!(threads[0]["origin_deleted"], true);
+    let mut deleted_revision_comment = payload.clone();
+    deleted_revision_comment["idempotency_key"] = json!("deleted-revision-new-thread");
+    assert_eq!(
+        t.req("POST", &endpoint, &owner, deleted_revision_comment)
+            .await
+            .0,
+        400
+    );
+    assert_eq!(
+        t.req("POST", &lifecycle, &owner, json!({"action":"archive"}))
+            .await
+            .0,
+        200
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            t.req("POST", &lifecycle, &owner, json!({"action":"delete"}))
+                .await
+                .0,
+            200
+        );
+    }
+    assert_eq!(t.req("GET", &endpoint, "", json!({})).await.1, json!([]));
+    assert_eq!(
+        t.req("POST", &lifecycle, &owner, json!({"action":"restore"}))
+            .await
+            .0,
+        409
+    );
+    assert_eq!(t.req("POST", &reply_url, &owner, reply).await.0, 409);
+    assert_eq!(t.req("POST", &endpoint, &owner, payload).await.0, 409);
+    let (other, _) = t.publish(&owner, "link-only").await;
+    let other_id = other["id"].as_str().unwrap();
+    assert_eq!(
+        t.req(
+            "POST",
+            &format!("/api/shares/{other_id}/revisions/{rid}/delete"),
+            &owner,
+            json!({})
+        )
+        .await
+        .0,
+        404
+    );
+    assert_eq!(
+        t.req(
+            "POST",
+            &format!("/api/shares/{other_id}/threads/{tid}/lifecycle"),
+            &owner,
+            json!({"action":"delete"})
+        )
+        .await
+        .0,
+        404
+    );
+}
+
+#[tokio::test]
+async fn dashboard_guides_cover_desktop_and_web_agents_with_the_configured_origin() {
+    let t = Test::new(true);
+    let owner = t.login("owner").await;
+    let (status, body, _) = t.req("GET", "/", &owner, json!({})).await;
+    assert_eq!(status, 200);
+    let html = body["html"].as_str().unwrap();
+    for guide in ["codex", "claude-code", "claude-web", "chatgpt-web"] {
+        assert!(html.contains(&format!("data-agent-guide=\"{guide}\"")));
+    }
+    assert!(html.contains(
+        "claude mcp add --transport http --scope user artifact-board http://127.0.0.1:4317/mcp"
+    ));
+    assert!(html.contains("Register automatically"));
+    assert!(html.contains("dynamic client registration (DCR)"));
+    assert!(html.contains("id=\"agent-client\""));
+    assert_eq!(html.matches("id=\"agent-server-url\"").count(), 1);
 }

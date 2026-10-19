@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod core;
 pub mod ingest;
+pub mod oauth;
 pub mod server;
 pub mod ui;
 

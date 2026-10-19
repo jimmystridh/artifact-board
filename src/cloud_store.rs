@@ -14,6 +14,7 @@ use url::Url;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Collection {
+    OAuthGrants,
     Principals,
     BuildJobs,
     Participants,
@@ -21,6 +22,7 @@ pub enum Collection {
     Shares,
     Uploads,
     Revisions,
+    RevisionTombstones,
     Threads,
     Comments,
     Placements,
@@ -31,6 +33,7 @@ pub enum Collection {
 impl Collection {
     fn name(self) -> &'static str {
         match self {
+            Self::OAuthGrants => "oauth_grants",
             Self::Principals => "principals",
             Self::BuildJobs => "build_jobs",
             Self::Participants => "participants",
@@ -38,6 +41,7 @@ impl Collection {
             Self::Shares => "shares",
             Self::Uploads => "uploads",
             Self::Revisions => "revisions",
+            Self::RevisionTombstones => "revision_tombstones",
             Self::Threads => "threads",
             Self::Comments => "comments",
             Self::Placements => "placements",
@@ -51,6 +55,7 @@ impl Collection {
             self,
             Self::BatchEvents
                 | Self::Revisions
+                | Self::RevisionTombstones
                 | Self::Comments
                 | Self::Placements
                 | Self::Events

@@ -99,6 +99,8 @@ impl Store {
         ) -> Value
     );
     dispatch!(resolve(p: &Principal, id: &str, thread: &str, resolved: bool) -> Value);
+    dispatch!(delete_revision(p: &Principal, id: &str, revision: &str) -> Value);
+    dispatch!(moderate_thread(p: &Principal, id: &str, thread: &str, action: &str) -> Value);
     dispatch!(lifecycle(p: &Principal, id: &str, action: &str) -> Value);
     dispatch!(notification_status(p: &Principal, id: &str) -> Value);
     pub fn kind(&self) -> &'static str {

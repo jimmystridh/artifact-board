@@ -82,6 +82,8 @@ impl Core {
  CREATE TABLE IF NOT EXISTS finalize_attempts(upload TEXT PRIMARY KEY REFERENCES uploads(id),claim TEXT NOT NULL,lease_until INTEGER NOT NULL,error TEXT);
  CREATE TABLE IF NOT EXISTS share_versions(share TEXT PRIMARY KEY REFERENCES shares(id),version INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS revisions(id TEXT PRIMARY KEY,share TEXT NOT NULL REFERENCES shares(id),entrypoint TEXT NOT NULL,digest TEXT NOT NULL,manifest TEXT NOT NULL,created INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS deleted_revisions(revision TEXT PRIMARY KEY REFERENCES revisions(id),deleted INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS thread_states(thread TEXT PRIMARY KEY REFERENCES threads(id),state TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS files(revision TEXT NOT NULL REFERENCES revisions(id),path TEXT NOT NULL,bytes BLOB NOT NULL,PRIMARY KEY(revision,path));
  CREATE TABLE IF NOT EXISTS threads(id TEXT PRIMARY KEY,share TEXT NOT NULL REFERENCES shares(id),revision TEXT NOT NULL REFERENCES revisions(id),anchor TEXT NOT NULL,resolved INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS comment_receipts(share TEXT NOT NULL REFERENCES shares(id),actor_scope TEXT NOT NULL,operation TEXT NOT NULL,request_key TEXT NOT NULL,fingerprint TEXT NOT NULL,response_json TEXT NOT NULL,created INTEGER NOT NULL,PRIMARY KEY(share,actor_scope,operation,request_key));
@@ -199,7 +201,7 @@ impl Core {
         owner(&c, p, sid)?;
         let mut out = share(&c, sid, true)?;
         let mut q = c.prepare(
-            "SELECT id,entrypoint,digest,created FROM revisions WHERE share=? ORDER BY created,id",
+            "SELECT id,entrypoint,digest,created FROM revisions WHERE share=? AND id NOT IN (SELECT revision FROM deleted_revisions) ORDER BY created,id",
         )?;
         let rows=q.query_map([sid],|r|Ok(json!({"id":r.get::<_,String>(0)?,"entrypoint":r.get::<_,String>(1)?,"digest":r.get::<_,String>(2)?,"created_at":r.get::<_,i64>(3)?})))?.collect::<Result<Vec<_>,_>>()?;
         out["revisions"] = json!(rows);
@@ -518,7 +520,7 @@ impl Core {
         )?;
         bump_share_version(&tx, sid)?;
         let origins = {
-            let mut q = tx.prepare("SELECT id,anchor FROM threads WHERE share=? AND resolved=0")?;
+            let mut q = tx.prepare("SELECT id,anchor FROM threads WHERE share=? AND resolved=0 AND id NOT IN (SELECT thread FROM thread_states WHERE state IN ('archived','deleted'))")?;
 
             q.query_map([sid], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -550,7 +552,7 @@ impl Core {
         let sid = view(&c, capability, p)?;
         let mut v = share(&c, &sid, false)?;
         let mut q = c.prepare(
-            "SELECT id,entrypoint,created FROM revisions WHERE share=? ORDER BY created,rowid",
+            "SELECT id,entrypoint,created FROM revisions WHERE share=? AND id NOT IN (SELECT revision FROM deleted_revisions) ORDER BY created,rowid",
         )?;
         let rows=q.query_map([&sid],|r|Ok(json!({"id":r.get::<_,String>(0)?,"entrypoint":r.get::<_,String>(1)?,"created_at":r.get::<_,i64>(2)?})))?.collect::<Result<Vec<_>,_>>()?;
         v["revisions"] = json!(rows);
@@ -568,7 +570,7 @@ impl Core {
             Some(r) => r.to_string(),
             None => c.query_row("SELECT latest FROM shares WHERE id=?", [&sid], |r| r.get(0))?,
         };
-        c.query_row("SELECT id,entrypoint,digest,created FROM revisions WHERE id=? AND share=?",params![rid,sid],|r|Ok(json!({"id":r.get::<_,String>(0)?,"entrypoint":r.get::<_,String>(1)?,"digest":r.get::<_,String>(2)?,"created_at":r.get::<_,i64>(3)?}))).optional()?.ok_or_else(||err(404,"not_found","Revision not found"))
+        c.query_row("SELECT id,entrypoint,digest,created FROM revisions WHERE id=? AND share=? AND id NOT IN (SELECT revision FROM deleted_revisions)",params![rid,sid],|r|Ok(json!({"id":r.get::<_,String>(0)?,"entrypoint":r.get::<_,String>(1)?,"digest":r.get::<_,String>(2)?,"created_at":r.get::<_,i64>(3)?}))).optional()?.ok_or_else(||err(404,"not_found","Revision not found"))
     }
     pub fn revision_files(
         &self,
@@ -583,7 +585,7 @@ impl Core {
             None => c.query_row("SELECT latest FROM shares WHERE id=?", [&sid], |r| r.get(0))?,
         };
         let exists: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM revisions WHERE id=? AND share=?)",
+            "SELECT EXISTS(SELECT 1 FROM revisions WHERE id=? AND share=? AND id NOT IN (SELECT revision FROM deleted_revisions))",
             params![rid, sid],
             |r| r.get(0),
         )?;
@@ -658,6 +660,7 @@ impl Core {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let sid = view(&tx, capability, p)?;
         if let Some(result) = replay_comment(&tx, &sid, "thread", receipt, &fingerprint)? {
+            active_thread(&tx, result["id"].as_str().unwrap_or(""))?;
             return Ok(result);
         }
         valid_body(body)?;
@@ -669,7 +672,7 @@ impl Core {
             ));
         }
         let valid: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM revisions WHERE id=? AND share=?)",
+            "SELECT EXISTS(SELECT 1 FROM revisions WHERE id=? AND share=? AND id NOT IN (SELECT revision FROM deleted_revisions))",
             params![revision, sid],
             |r| r.get(0),
         )?;
@@ -740,10 +743,12 @@ impl Core {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let sid = view(&tx, capability, p)?;
         if let Some(result) = replay_comment(&tx, &sid, "reply", receipt, &fingerprint)? {
+            active_thread(&tx, result["id"].as_str().unwrap_or(""))?;
             return Ok(result);
         }
         valid_body(body)?;
         thread_belongs(&tx, &sid, tid)?;
+        active_thread(&tx, tid)?;
         let a = actor(&tx, p, guest_name)?;
         let comment_id = post(&tx, &sid, tid, &a, p, body, now())?;
         let mut result = thread(&tx, tid)?;
@@ -763,11 +768,59 @@ impl Core {
         owner(&c, p, sid)?;
         writable(&c, sid)?;
         thread_belongs(&c, sid, tid)?;
+        active_thread(&c, tid)?;
         c.execute(
             "UPDATE threads SET resolved=? WHERE id=?",
             params![resolved, tid],
         )?;
         thread(&c, tid)
+    }
+    pub fn delete_revision(&self, p: &Principal, sid: &str, rid: &str) -> Result<Value, AppError> {
+        let mut c = self.lock()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        owner(&tx, p, sid)?;
+        writable(&tx, sid)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM revisions WHERE id=? AND share=?)",
+            params![rid, sid],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(err(404, "not_found", "Revision not found"));
+        }
+        let latest: Option<String> =
+            tx.query_row("SELECT latest FROM shares WHERE id=?", [sid], |r| r.get(0))?;
+        if latest.as_deref() == Some(rid) {
+            return Err(err(
+                409,
+                "latest_revision",
+                "The latest revision cannot be deleted. Publish a new revision first.",
+            ));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO deleted_revisions VALUES(?,?)",
+            params![rid, now()],
+        )?;
+        tx.commit()?;
+        Ok(json!({"id":rid,"state":"deleted"}))
+    }
+    pub fn moderate_thread(
+        &self,
+        p: &Principal,
+        sid: &str,
+        tid: &str,
+        action: &str,
+    ) -> Result<Value, AppError> {
+        let mut c = self.lock()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        owner(&tx, p, sid)?;
+        writable(&tx, sid)?;
+        thread_belongs(&tx, sid, tid)?;
+        let state = thread_state(&tx, tid)?;
+        let next = discussion_transition(&state, action)?;
+        tx.execute("INSERT INTO thread_states VALUES(?,?) ON CONFLICT(thread) DO UPDATE SET state=excluded.state",params![tid,next])?;
+        tx.commit()?;
+        Ok(json!({"id":tid,"state":next}))
     }
     pub fn lifecycle(&self, p: &Principal, sid: &str, action: &str) -> Result<Value, AppError> {
         let mut c = self.lock()?;
@@ -1159,18 +1212,56 @@ fn post(
     }
     Ok(comment_id)
 }
+pub(crate) fn discussion_transition(state: &str, action: &str) -> Result<&'static str, AppError> {
+    match (state, action) {
+        ("active" | "archived", "archive") => Ok("archived"),
+        ("active" | "archived", "restore") => Ok("active"),
+        ("archived" | "deleted", "delete") => Ok("deleted"),
+        (_, "archive" | "restore" | "delete") => Err(err(
+            409,
+            "discussion_state",
+            "Only archived discussions can be deleted. Deleted discussions cannot be restored.",
+        )),
+        _ => Err(err(400, "invalid_action", "Unknown discussion action")),
+    }
+}
+fn thread_state(c: &Connection, tid: &str) -> Result<String, AppError> {
+    Ok(c.query_row(
+        "SELECT state FROM thread_states WHERE thread=?",
+        [tid],
+        |r| r.get(0),
+    )
+    .optional()?
+    .unwrap_or_else(|| "active".into()))
+}
+fn active_thread(c: &Connection, tid: &str) -> Result<(), AppError> {
+    if thread_state(c, tid)? != "active" {
+        return Err(err(
+            409,
+            "discussion_state",
+            "Restore this discussion before replying or resolving it",
+        ));
+    }
+    Ok(())
+}
 fn thread(c: &Connection, tid: &str) -> Result<Value, AppError> {
     let mut v=c.query_row("SELECT id,share,revision,anchor,resolved,created FROM threads WHERE id=?",[tid],|r|{let a:String=r.get(3)?;Ok(json!({"id":r.get::<_,String>(0)?,"share_id":r.get::<_,String>(1)?,"original_revision":r.get::<_,String>(2)?,"original_anchor":serde_json::from_str::<Value>(&a).unwrap_or(json!({})),"resolved":r.get::<_,bool>(4)?,"created_at":r.get::<_,i64>(5)?}))})?;
     let mut q=c.prepare("SELECT id,actor,name,verified,body,created FROM comments WHERE thread=? ORDER BY created,rowid")?;
     let comments=q.query_map([tid],|r|Ok(json!({"id":r.get::<_,String>(0)?,"actor_id":r.get::<_,String>(1)?,"display_name":r.get::<_,String>(2)?,"authenticated":r.get::<_,bool>(3)?,"body":r.get::<_,String>(4)?,"created_at":r.get::<_,i64>(5)?})))?.collect::<Result<Vec<_>,_>>()?;
     let mut q = c.prepare("SELECT revision,status,anchor,reason FROM placements WHERE thread=?")?;
     let placements=q.query_map([tid],|r|{let a:String=r.get(2)?;Ok(json!({"revision_id":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"anchor":serde_json::from_str::<Value>(&a).unwrap_or(json!({})),"reason":r.get::<_,String>(3)?,"algorithm":"conservative-v1"}))})?.collect::<Result<Vec<_>,_>>()?;
+    v["state"] = json!(thread_state(c, tid)?);
+    v["origin_deleted"] = json!(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM deleted_revisions WHERE revision=?)",
+        [&v["original_revision"].as_str().unwrap_or("")],
+        |r| r.get::<_, bool>(0)
+    )?);
     v["comments"] = json!(comments);
     v["placements"] = json!(placements);
     Ok(v)
 }
 fn thread_list(c: &Connection, sid: &str) -> Result<Value, AppError> {
-    let mut q = c.prepare("SELECT id FROM threads WHERE share=? ORDER BY created,rowid")?;
+    let mut q = c.prepare("SELECT id FROM threads WHERE share=? AND id NOT IN (SELECT thread FROM thread_states WHERE state='deleted') ORDER BY created,rowid")?;
     let ids = q
         .query_map([sid], |r| r.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;

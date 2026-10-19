@@ -10,17 +10,17 @@ function harness(pathname='/content/capability/revision/docs/index.html'){
  const windowEvents={},documentEvents={},messages=[];
  class Element{
   constructor(tag='P'){this.tagName=tag;this.style={outline:''};this.dataset={};this.id='intro';this.textContent='A thoughtful daily planner';this.parentElement=null;this.children=[];this.removed=false}
-  closest(){return null} getAttribute(){return null} setAttribute(){} addEventListener(){} append(){} remove(){this.removed=true} scrollIntoView(){this.scrolled=true} getBoundingClientRect(){return {top:50,right:200}}
+  closest(){return null} getAttribute(){return null} setAttribute(){} addEventListener(){} append(el){this.children.push(el)} remove(){this.removed=true} scrollIntoView(){this.scrolled=true} getBoundingClientRect(){return {top:50,right:200}}
  }
  const body=new Element('BODY');body.id='';
  let selected='A thoughtful daily planner',collapsed=false,lookups=0;
  const document={body,documentElement:{clientWidth:800},addEventListener:(name,callback)=>{documentEvents[name]=callback},createRange:()=>({selectNodeContents(){},setEnd(){this.before=true},setStart(){},toString(){return this.before?'prefix '.repeat(30):'suffix '.repeat(30)}}),getElementById:()=>{lookups++;return null},querySelectorAll:()=>[],createTreeWalker:()=>({nextNode:()=>null}),createElement:tag=>new Element(tag.toUpperCase())};
  const parent={postMessage:(message,target)=>messages.push({message,target})};
- const context={window:{addEventListener:(name,callback)=>{windowEvents[name]=callback}},document,parent,HTMLElement:Element,CSS:{escape:x=>x},NodeFilter:{SHOW_TEXT:4,FILTER_ACCEPT:1,FILTER_REJECT:2},getSelection:()=>({isCollapsed:collapsed,rangeCount:1,toString:()=>selected,getRangeAt:()=>({startContainer:body,endContainer:body,startOffset:0,endOffset:1})}),location:{pathname},scrollX:0,scrollY:0,setTimeout:callback=>callback(),console};
+ const context={innerWidth:800,innerHeight:600,clearTimeout(){},window:{scrollTo(value){context.scrollY=value.top;context.scrollX=value.left},addEventListener:(name,callback)=>{windowEvents[name]=callback}},document,parent,HTMLElement:Element,CSS:{escape:x=>x},NodeFilter:{SHOW_TEXT:4,FILTER_ACCEPT:1,FILTER_REJECT:2},getSelection:()=>({isCollapsed:collapsed,rangeCount:1,toString:()=>selected,getRangeAt:()=>({startContainer:body,endContainer:body,startOffset:0,endOffset:1})}),location:{pathname,hash:''},scrollX:0,scrollY:0,setTimeout:callback=>callback(),console};
  vm.runInNewContext(source,context,{timeout:1000});
  function message(data,source=parent){windowEvents.message({source,data:{source:'artifact-shell',nonce:NONCE,...data}})}
  function event(name,target=new Element()){const event={target,key:'',prevented:false,stopped:false,preventDefault(){this.prevented=true},stopImmediatePropagation(){this.stopped=true}};documentEvents[name](event);return event}
- return {message,event,messages,parent,Element,documentEvents,setSelection:(s,c=false)=>{selected=s;collapsed=c},get lookups(){return lookups}};
+ return {message,event,messages,parent,Element,document,context,windowEvents,documentEvents,setSelection:(s,c=false)=>{selected=s;collapsed=c},get lookups(){return lookups}};
 }
 test('handshake requires exact parent and bounded random nonce; nonce stays pinned',()=>{
  const h=harness();h.message({type:'hello'},{});assert.equal(h.messages.length,0);
@@ -61,4 +61,17 @@ test('anchors stay in their original artifact document despite shared IDs',()=>{
  h.message({type:'placements',threads:[{id:'thread',anchor:{kind:'element',element_id:'intro',path:'docs/two.html'}}]});assert.equal(h.lookups,0);
  h.message({type:'focus',anchor:{kind:'element',element_id:'intro',path:{}}});assert.equal(h.lookups,0);
  h.message({type:'focus',anchor:{kind:'element',element_id:'intro',path:'docs/one.html'}});assert.equal(h.lookups,1);
+});
+
+test('general position capture and focus restore the document and nested scroll offsets',()=>{
+ const h=harness();const reader=new h.Element();reader.id='reader';reader.scrollHeight=1600;reader.clientHeight=500;reader.scrollTop=450;reader.scrollLeft=0;reader.scrollTo=p=>{reader.scrollTop=p.top};
+ const target=new h.Element();target.id='chapter';target.parentElement=reader;h.document.elementFromPoint=()=>target;h.document.querySelectorAll=s=>s==='#reader'?[reader]:[];h.context.scrollY=900;
+ h.message({type:'hello'});h.message({type:'capture-position'});const anchor=h.messages.at(-1).message.anchor;assert.equal(anchor.kind,'general');assert.equal(anchor.position.y,900);assert.equal(anchor.position.scrolls[0].top,450);
+ h.context.scrollY=0;reader.scrollTop=0;h.message({type:'focus',anchor});assert.equal(h.context.scrollY,900);assert.equal(reader.scrollTop,450);
+});
+test('markers show comment counts, follow scrolling, and disable removes them and all selection interception',()=>{
+ const h=harness();const target=new h.Element();h.document.getElementById=()=>target;h.message({type:'hello'});h.message({type:'placements',threads:[{id:'one',count:3,anchor:{kind:'element',element_id:'intro'}}]});
+ assert.equal(h.document.body.children.at(-1).textContent,'3');const first=h.document.body.children.at(-1);h.windowEvents.scroll();assert.equal(first.removed,true);
+ h.message({type:'mode',mode:'element'});h.message({type:'disable'});assert.equal(h.document.body.children.at(-1).removed,true);assert.equal(h.event('click').prevented,false);const count=h.messages.length;h.event('mouseup');h.message({type:'capture-position'});assert.equal(h.messages.length,count);
+ h.message({type:'mode',mode:'element'});assert.equal(h.event('click').prevented,false);
 });

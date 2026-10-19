@@ -83,6 +83,7 @@ function allFiles(directory, relative = '') {
   assert.equal(finalizes, 1); assert.equal(buildPolls, 3);
   assert.equal(await page.evaluate(() => sessionStorage.getItem('artifact-pending-build')), null);
   const reviewURL = page.url();
+  await page.locator('#toggle-discussion').click();
   const frame = page.frameLocator('#artifact-frame');
   await frame.locator('#cta').click(); assert.equal(await frame.locator('#cta').innerText(), 'Thanks for your interest');
   assert.equal(await page.locator('#artifact-frame').getAttribute('sandbox'), 'allow-scripts');
@@ -118,7 +119,7 @@ function allFiles(directory, relative = '') {
   await page.locator('#toggle-discussion').click(); assert.equal(await page.locator('#discussion-panel').isVisible(), true);
 
   // Guest identity is explicitly unverified, and guest links grant no management.
-  const guest = await browser.newContext(); const guestPage = await guest.newPage(); await guestPage.goto(reviewURL);
+  const guest = await browser.newContext(); const guestPage = await guest.newPage(); await guestPage.goto(reviewURL); await guestPage.locator('#toggle-discussion').click();
   await guestPage.locator('#guest-name').fill('banana'); await guestPage.locator('#comment-body').fill('<img src=x onerror=alert(1)> is just text');
   await guestPage.getByRole('button', { name: 'Post comment ↑' }).click(); await guestPage.getByText('banana', { exact: true }).waitFor();
   assert.ok(await guestPage.locator('.guest-tag').count()); assert.equal(await guestPage.locator('.thread-body img').count(), 0);

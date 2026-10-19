@@ -1,0 +1,13 @@
+.gcloudignore
+.git
+.local
+target
+node_modules
+deploy
+docs
+tests
+.github
+README.md
+.env*
+*.sqlite*
+__pycache__
