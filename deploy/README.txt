@@ -189,3 +189,30 @@ tab, removed archived tab and revision picker verified. Build
 scaling remains 0/1 and identities, secret references, jobs, IAM and schedules
 are unchanged. No test comments or revisions were added to user documents.
 No Git commit or source push was made for this change.
+
+Signed upload intent rollout (2026-10-27): API revision artifact-board-pilot-00012-np5 adds the
+create_upload_intent MCP tool and POST /api/uploads/{id}/intent API. The agent
+sends upload ID, format, relative path, exact byte count and SHA-256. The result
+contains a signed PUT URL, method, headers and expiry. External curl/Python PUTs
+send the raw file or ZIP without OAuth bearer tokens, cookies, or file bytes in
+MCP. The capability is audience-separated, hash/size/session/owner-bound and
+expires after at most ten minutes. It only stages bytes; finalization remains
+owner-authenticated with existing stable receipts and build handling. Existing
+path/archive/quota/lifecycle/frozen-upload validation still applies. Legacy
+inline upload remains available. This is an application-signed API URL, not a
+GCS presign; no new cloud permissions or resources were required. See
+docs/AGENT-PUBLISHING.md for the agent workflow and examples.
+
+Validation: 46 unit tests, 12 HTTP tests including real local Firestore, 8 OAuth
+tests, 80 JavaScript tests, strict Clippy/formatting, curl and Python direct PUT
+smoke, and immutable image smoke. Other full-suite contracts passed on the
+rerun; an initial existing React concurrency test failed with build_conflict,
+then passed. A stale web-client assertion expecting 15 tools was updated to 16.
+The initial image scan found CVE-2026-109869 in the existing npm undici pin;
+upgraded 6.28.1 to upstream-patched 6.29.1 and rebuilt. Final scan gate passed:
+zero critical and zero fixable high/critical findings. The exact deployed image
+passed signed upload/publication and existing feature checks. Build
+ccb9e65c-b20d-42e1-9e27-8b10fbb718a7. API image/config-version only; min/max 0/1,
+identities, secret refs, worker jobs, IAM and schedules unchanged. Production
+verification checked image digest, traffic, health and assets. User documents
+were not modified. No Git commit or push was made.

@@ -34,7 +34,7 @@
         "timeoutSeconds": 300,
         "containers": [
           {
-            "image": "europe-north2-docker.pkg.dev/dev-innov-cm/cloud-run-source-deploy/artifact-board-pilot@sha256:6b1097064d108ed188624bb1ace18da47cd252ac92976ff4141399220af80ae9",
+            "image": "europe-north2-docker.pkg.dev/dev-innov-cm/cloud-run-source-deploy/artifact-board-pilot@sha256:da635ce995b9283e14cee0d5abd8be0a8f26426df3553b35f1dbf233dcf32147",
             "ports": [
               {
                 "containerPort": 8080
@@ -123,7 +123,7 @@
               },
               {
                 "name": "ARTIFACT_CONFIG_VERSION",
-                "value": "resolve-delete-20261019-39551ae465c5"
+                "value": "upload-intent-20261027-2699668a44f5"
               }
             ],
             "startupProbe": {

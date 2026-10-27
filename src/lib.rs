@@ -4,6 +4,7 @@ pub mod ingest;
 pub mod oauth;
 pub mod server;
 pub mod ui;
+pub mod upload_intent;
 
 pub mod cloud_store;
 

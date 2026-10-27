@@ -271,7 +271,7 @@ async fn discovery_registration_consent_pkce_and_mcp_work_without_browser_cookie
             json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
         )
         .await;
-    assert_eq!(r.json()["result"]["tools"].as_array().unwrap().len(), 15);
+    assert_eq!(r.json()["result"]["tools"].as_array().unwrap().len(), 16);
     assert_eq!(
         t.req(
             "GET",
@@ -649,7 +649,7 @@ async fn web_clients_complete_pkce_consent_exchange_refresh_and_mcp_access() {
         assert_eq!(tools.status, StatusCode::OK);
         assert_eq!(
             tools.json()["result"]["tools"].as_array().unwrap().len(),
-            15
+            16
         );
         assert_eq!(
             t.refresh(&client, tokens["refresh_token"].as_str().unwrap())

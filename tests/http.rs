@@ -10,6 +10,142 @@ struct Test {
     _dir: tempfile::TempDir,
 }
 
+#[tokio::test]
+async fn signed_upload_intent_without_session() {
+    upload_intent_case(Test::new(true)).await;
+}
+#[tokio::test]
+#[ignore = "requires real local Firestore emulator and fake GCS"]
+async fn firestore_signed_upload_intent_without_session() {
+    upload_intent_case(Test::cloud()).await;
+}
+async fn raw_put(t: &Test, url: &str, content_type: &str, bytes: Vec<u8>) -> StatusCode {
+    let url = url.strip_prefix("http://127.0.0.1:4317").unwrap_or(url);
+    t.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(url)
+                .header("content-type", content_type)
+                .body(Body::from(bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+async fn upload_intent_case(t: Test) {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    let owner = t.login("owner").await;
+    let reviewer = t.login("reviewer").await;
+    let (share, _) = t.publish(&owner, "link-only").await;
+    let content = b"<h1>Uploaded without MCP payloads</h1>";
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.start_file("index.html", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(content).unwrap();
+    let zip = zip.finish().unwrap().into_inner();
+    for (format, path, bytes, content_type) in [
+        (
+            "file",
+            "index.html",
+            content.to_vec(),
+            "application/octet-stream",
+        ),
+        ("zip", "report.zip", zip, "application/zip"),
+    ] {
+        let (_, upload, _) = t
+            .req(
+                "POST",
+                &format!("/api/shares/{}/uploads", share["id"].as_str().unwrap()),
+                &owner,
+                json!({}),
+            )
+            .await;
+        let id = upload["id"].as_str().unwrap();
+        let endpoint = format!("/api/uploads/{id}/intent");
+        assert_eq!(t.req("POST", &endpoint, &owner, json!([])).await.0, 400);
+        let metadata = json!({"format":format,"path":path,"size_bytes":bytes.len(),"sha256":format!("{:x}",Sha256::digest(&bytes))});
+        assert_eq!(t.req("POST", &endpoint, "", metadata.clone()).await.0, 401);
+        assert_eq!(
+            t.req("POST", &endpoint, &reviewer, metadata.clone())
+                .await
+                .0,
+            403
+        );
+        let mut invalid = metadata.clone();
+        invalid["path"] = json!("../escape");
+        assert_eq!(t.req("POST", &endpoint, &owner, invalid).await.0, 400);
+        let mut invalid = metadata.clone();
+        invalid["size_bytes"] = json!(33 * 1024 * 1024);
+        assert_eq!(t.req("POST", &endpoint, &owner, invalid).await.0, 400);
+        let mut arguments = metadata.clone();
+        arguments["upload_id"] = json!(id);
+        let (_, rpc, _) = t.req("POST", "/mcp", &owner,json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_upload_intent","arguments":arguments}})).await;
+        assert_eq!(rpc["result"]["isError"], false, "{rpc}");
+        let intent = &rpc["result"]["structuredContent"];
+        let url = intent["upload_url"].as_str().unwrap();
+        assert_eq!(intent["upload_id"], id);
+        assert_eq!(intent["headers"]["Content-Type"], content_type);
+        assert_eq!(intent["method"], "PUT");
+        assert!(intent["expires_at"].as_u64().unwrap() <= artifact_board::auth::now() + 600);
+        assert_eq!(raw_put(&t, url, "text/plain", bytes.clone()).await, 400);
+        let mut wrong = bytes.clone();
+        wrong[0] ^= 1;
+        assert_eq!(raw_put(&t, url, content_type, wrong).await, 400);
+        assert_eq!(
+            raw_put(&t, url, content_type, bytes[..bytes.len() - 1].to_vec()).await,
+            400
+        );
+        assert_eq!(
+            raw_put(&t, url, content_type, vec![0; bytes.len() + 2]).await,
+            413
+        );
+        let mut tampered = url.as_bytes().to_vec();
+        let index = tampered.len() - 8;
+        tampered[index] = if tampered[index] == b'A' { b'B' } else { b'A' };
+        assert_eq!(
+            raw_put(
+                &t,
+                &String::from_utf8(tampered).unwrap(),
+                content_type,
+                bytes.clone()
+            )
+            .await,
+            403
+        );
+        assert_eq!(raw_put(&t, url, content_type, bytes.clone()).await, 200);
+        assert_eq!(raw_put(&t, url, content_type, bytes.clone()).await, 200);
+        let finalize = format!("/api/uploads/{id}/finalize");
+        let payload = json!({"entrypoint":"index.html","idempotency_key":format!("intent-{format}"),"mutation_actor":"auth:dev-owner"});
+        assert_eq!(t.req("POST", &finalize, "", payload.clone()).await.0, 401);
+        let (status, ready, _) = t.req("POST", &finalize, &owner, payload.clone()).await;
+        assert_eq!(status, 200, "{ready}");
+        assert_eq!(t.req("POST", &finalize, &owner, payload).await.1, ready);
+        assert_eq!(raw_put(&t, url, content_type, bytes).await, 409);
+        assert_eq!(t.req("POST", &endpoint, &owner, metadata).await.0, 409);
+        let result = t
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/content/{}/{}/index.html",
+                        share["capability"].as_str().unwrap(),
+                        ready["revision_id"].as_str().unwrap()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status(), 200);
+        let body = to_bytes(result.into_body(), 1_000_000).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Uploaded without MCP payloads"));
+    }
+}
 impl Test {
     fn new(dev: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
