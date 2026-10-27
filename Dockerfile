@@ -15,7 +15,7 @@ RUN apt-get update && apt-get upgrade -y \
     && mkdir -p /tmp/npm-securitydeps \
     && printf '%s\n' '{"private":true}' > /tmp/npm-securitydeps/package.json \
     && npm install --prefix /tmp/npm-securitydeps --install-strategy=nested --omit=dev \
-        --ignore-scripts --no-audit --no-fund --save-exact brace-expansion@5.0.11 undici@6.28.1 \
+        --ignore-scripts --no-audit --no-fund --save-exact brace-expansion@5.0.11 undici@6.29.1 \
     && rm -rf /usr/local/lib/node_modules/npm/node_modules/brace-expansion \
         /usr/local/lib/node_modules/npm/node_modules/undici \
     && cp -a /tmp/npm-securitydeps/node_modules/brace-expansion \
