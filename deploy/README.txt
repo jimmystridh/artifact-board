@@ -171,3 +171,21 @@ passed the existing gate. Only API image/config-version changed; min/max remain
 0/1, with runtime identities, Entra app, secrets, jobs, IAM and schedules unchanged.
 Previous revision 00009-q48 is retained; reverting would disable new web-client
 registrations. No Git commit or source push was made.
+
+Resolved discussion deletion rollout (2026-10-19): API revision artifact-board-pilot-00011-9cp removes
+the comment Archive action and Archived tab. Authors resolve comments, then
+optionally delete the resolved discussion and its replies with confirmation.
+Reopen remains available. Unresolved deletion is rejected by both storage
+backends; deleted discussions cannot be reopened or replayed from saved comment
+receipts. Existing archived records are presented under Resolved and can be
+reopened or deleted. The launcher count and document markers include only open
+discussions. Whole-share lifecycle controls are unchanged.
+
+Validation: 80 JavaScript tests, 10 HTTP tests including SQLite and real local
+Firestore legacy archive compatibility, strict Clippy/formatting, image scan
+gate and immutable image smoke tests. Live health, exact JS/CSS assets, resolved
+tab, removed archived tab and revision picker verified. Build
+1543cef7-8aa2-41e3-8785-ff7fa03a74d5. Only API image/config-version changed;
+scaling remains 0/1 and identities, secret references, jobs, IAM and schedules
+are unchanged. No test comments or revisions were added to user documents.
+No Git commit or source push was made for this change.

@@ -9,6 +9,7 @@ struct Test {
     router: axum::Router,
     _dir: tempfile::TempDir,
 }
+
 impl Test {
     fn new(dev: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -478,13 +479,13 @@ async fn history_case(t: Test) {
     );
     let lifecycle = format!("/api/shares/{sid}/threads/{tid}/lifecycle");
     assert_eq!(
-        t.req("POST", &lifecycle, &reviewer, json!({"action":"archive"}))
+        t.req("POST", &lifecycle, &reviewer, json!({"action":"delete"}))
             .await
             .0,
         403
     );
     assert_eq!(
-        t.req("POST", &lifecycle, "", json!({"action":"archive"}))
+        t.req("POST", &lifecycle, "", json!({"action":"delete"}))
             .await
             .0,
         401
@@ -495,30 +496,78 @@ async fn history_case(t: Test) {
             .0,
         409
     );
+    // Seed the previous release's storage format to verify archived comments remain accessible.
+    let database = t._dir.path().join("test.sqlite");
+    if database.exists() {
+        rusqlite::Connection::open(database)
+            .unwrap()
+            .execute("INSERT INTO thread_states VALUES(?,'archived')", [tid])
+            .unwrap();
+    } else {
+        use artifact_board::cloud_store::{CloudStore, Collection, Mutation, Precondition};
+        let cloud = CloudStore::emulator(
+            "demo-artifact-board",
+            "(default)",
+            "artifact-board-test",
+            &std::env::var("FIRESTORE_EMULATOR_URL").unwrap(),
+            &std::env::var("GCS_EMULATOR_URL").unwrap(),
+        )
+        .unwrap();
+        let token = cloud.runtime_token().await.unwrap();
+        let doc = cloud
+            .get(Collection::Threads, tid, None, &token)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = doc.data;
+        data["state"] = json!("archived");
+        cloud
+            .commit(
+                &[Mutation {
+                    collection: Collection::Threads,
+                    id: tid.into(),
+                    data,
+                    condition: Precondition::UpdateTime(doc.update_time),
+                }],
+                None,
+                &token,
+            )
+            .await
+            .unwrap();
+    }
+    let legacy = t.req("GET", &endpoint, "", json!({})).await.1;
+    assert_eq!(legacy[0]["state"], "active");
+    assert_eq!(legacy[0]["resolved"], true);
+    let resolve = format!("/api/shares/{sid}/threads/{tid}/resolve");
+    assert_eq!(
+        t.req("POST", &lifecycle, &owner, json!({"action":"archive"}))
+            .await
+            .0,
+        400
+    );
     for _ in 0..2 {
         assert_eq!(
-            t.req("POST", &lifecycle, &owner, json!({"action":"archive"}))
+            t.req("POST", &resolve, &owner, json!({"resolved":true}))
                 .await
                 .0,
             200
         );
     }
-    let (_, archived, _) = t.req("GET", &endpoint, "", json!({})).await;
-    assert_eq!(archived[0]["state"], "archived");
-    assert_eq!(archived[0]["comments"].as_array().unwrap().len(), 2);
+    let (_, resolved, _) = t.req("GET", &endpoint, "", json!({})).await;
+    assert_eq!(resolved[0]["resolved"], true);
+    assert_eq!(resolved[0]["state"], "active");
+    assert_eq!(resolved[0]["comments"].as_array().unwrap().len(), 2);
     assert_eq!(
-        t.req("POST", &reply_url, &owner, reply.clone()).await.0,
-        409
-    );
-    assert_eq!(
-        t.req("POST", &endpoint, &owner, payload.clone()).await.0,
-        409
-    );
-    assert_eq!(
-        t.req("POST", &lifecycle, &owner, json!({"action":"restore"}))
+        t.req("POST", &resolve, &owner, json!({"resolved":false}))
             .await
             .0,
         200
+    );
+    assert_eq!(
+        t.req("POST", &lifecycle, &owner, json!({"action":"delete"}))
+            .await
+            .0,
+        409
     );
     assert_eq!(
         t.req("POST", &reply_url, &owner, reply.clone()).await.0,
@@ -621,7 +670,7 @@ async fn history_case(t: Test) {
         400
     );
     assert_eq!(
-        t.req("POST", &lifecycle, &owner, json!({"action":"archive"}))
+        t.req("POST", &resolve, &owner, json!({"resolved":true}))
             .await
             .0,
         200
@@ -636,7 +685,7 @@ async fn history_case(t: Test) {
     }
     assert_eq!(t.req("GET", &endpoint, "", json!({})).await.1, json!([]));
     assert_eq!(
-        t.req("POST", &lifecycle, &owner, json!({"action":"restore"}))
+        t.req("POST", &resolve, &owner, json!({"resolved":false}))
             .await
             .0,
         409

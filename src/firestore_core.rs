@@ -86,7 +86,7 @@ fn active_discussion(t: &Value) -> Result<(), AppError> {
         return Err(err(
             409,
             "discussion_state",
-            "Restore this discussion before replying or resolving it",
+            "Reopen this discussion before replying. Deleted discussions cannot be reopened.",
         ));
     }
     Ok(())
@@ -935,6 +935,10 @@ impl FirestoreCore {
         if t["state"].is_null() {
             t["state"] = json!("active");
         }
+        if t["state"] == "archived" {
+            t["state"] = json!("active");
+            t["resolved"] = json!(true);
+        }
         t["origin_deleted"] = json!(
             self.revision_deleted(t["original_revision"].as_str().unwrap_or(""))
                 .await?
@@ -1139,8 +1143,15 @@ impl FirestoreCore {
                 if t.data["share_id"] != sid {
                     return Err(err(404, "not_found", "Thread not found"));
                 }
-                active_discussion(&t.data)?;
+                if t.data["state"] == "deleted" {
+                    return Err(err(
+                        409,
+                        "discussion_state",
+                        "Deleted discussions cannot be reopened",
+                    ));
+                }
                 let mut next = t.data.clone();
+                next["state"] = json!("active");
                 next["resolved"] = json!(resolved);
                 tx.update(C::Threads, tid, &t, next.clone());
                 Ok((tx, next))
@@ -1197,7 +1208,8 @@ impl FirestoreCore {
                 return Err(err(404, "not_found", "Thread not found"));
             }
             let state = t.data["state"].as_str().unwrap_or("active");
-            let next = crate::core::discussion_transition(state, action)?;
+            let next =
+                crate::core::discussion_transition(state, t.data["resolved"] == true, action)?;
             let mut value = t.data.clone();
             value["state"] = json!(next);
             tx.update(C::Threads, tid, &t, value);

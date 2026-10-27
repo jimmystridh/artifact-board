@@ -240,7 +240,7 @@ pub fn review(data: Value) -> String {
                         }
                         p { id: "selection-hint", class: "review-panel-hint", "Highlight text in the page, or select an element." }
                         div { class: "discussion-header", h2 { "Discussion" span { id: "thread-count", class: "count", "0" } } div { class: "tool-group", button { id: "refresh-discussion", class: "icon-button", aria_label: "Refresh discussion", title: "Refresh discussion", "↻" } button { id: "new-comment", class: "icon-button", aria_label: "New general comment", "+" } } }
-                        nav { class: "discussion-tabs", aria_label: "Discussion filter", button { class: "thread-filter active", "data-thread-filter": "open", "Open" } button { class: "thread-filter", "data-thread-filter": "unmatched", "Unmatched" } button { class: "thread-filter", "data-thread-filter": "resolved", "Resolved" } button { class: "thread-filter", "data-thread-filter": "archived", "Archived" } }
+                        nav { class: "discussion-tabs", aria_label: "Discussion filter", button { class: "thread-filter active", "data-thread-filter": "open", "Open" } button { class: "thread-filter", "data-thread-filter": "unmatched", "Unmatched" } button { class: "thread-filter", "data-thread-filter": "resolved", "Resolved" } }
                         div { id: "thread-list", class: "thread-list", aria_live: "polite" }
                         details { id: "comment-composer-panel", class: "comment-composer-panel",
                             summary { "Leave a comment" }

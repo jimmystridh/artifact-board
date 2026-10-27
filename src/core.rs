@@ -764,16 +764,26 @@ impl Core {
         tid: &str,
         resolved: bool,
     ) -> Result<Value, AppError> {
-        let c = self.lock()?;
-        owner(&c, p, sid)?;
-        writable(&c, sid)?;
-        thread_belongs(&c, sid, tid)?;
-        active_thread(&c, tid)?;
-        c.execute(
+        let mut c = self.lock()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        owner(&tx, p, sid)?;
+        writable(&tx, sid)?;
+        thread_belongs(&tx, sid, tid)?;
+        if thread_state(&tx, tid)? == "deleted" {
+            return Err(err(
+                409,
+                "discussion_state",
+                "Deleted discussions cannot be reopened",
+            ));
+        }
+        tx.execute("DELETE FROM thread_states WHERE thread=?", [tid])?;
+        tx.execute(
             "UPDATE threads SET resolved=? WHERE id=?",
             params![resolved, tid],
         )?;
-        thread(&c, tid)
+        let out = thread(&tx, tid)?;
+        tx.commit()?;
+        Ok(out)
     }
     pub fn delete_revision(&self, p: &Principal, sid: &str, rid: &str) -> Result<Value, AppError> {
         let mut c = self.lock()?;
@@ -817,7 +827,11 @@ impl Core {
         writable(&tx, sid)?;
         thread_belongs(&tx, sid, tid)?;
         let state = thread_state(&tx, tid)?;
-        let next = discussion_transition(&state, action)?;
+        let resolved: bool =
+            tx.query_row("SELECT resolved FROM threads WHERE id=?", [tid], |r| {
+                r.get(0)
+            })?;
+        let next = discussion_transition(&state, resolved, action)?;
         tx.execute("INSERT INTO thread_states VALUES(?,?) ON CONFLICT(thread) DO UPDATE SET state=excluded.state",params![tid,next])?;
         tx.commit()?;
         Ok(json!({"id":tid,"state":next}))
@@ -1212,15 +1226,17 @@ fn post(
     }
     Ok(comment_id)
 }
-pub(crate) fn discussion_transition(state: &str, action: &str) -> Result<&'static str, AppError> {
-    match (state, action) {
-        ("active" | "archived", "archive") => Ok("archived"),
-        ("active" | "archived", "restore") => Ok("active"),
-        ("archived" | "deleted", "delete") => Ok("deleted"),
-        (_, "archive" | "restore" | "delete") => Err(err(
+pub(crate) fn discussion_transition(
+    state: &str,
+    resolved: bool,
+    action: &str,
+) -> Result<&'static str, AppError> {
+    match action {
+        "delete" if resolved || state == "archived" || state == "deleted" => Ok("deleted"),
+        "delete" => Err(err(
             409,
             "discussion_state",
-            "Only archived discussions can be deleted. Deleted discussions cannot be restored.",
+            "Resolve this discussion before deleting it.",
         )),
         _ => Err(err(400, "invalid_action", "Unknown discussion action")),
     }
@@ -1239,7 +1255,7 @@ fn active_thread(c: &Connection, tid: &str) -> Result<(), AppError> {
         return Err(err(
             409,
             "discussion_state",
-            "Restore this discussion before replying or resolving it",
+            "Reopen this discussion before replying. Deleted discussions cannot be reopened.",
         ));
     }
     Ok(())
@@ -1251,6 +1267,10 @@ fn thread(c: &Connection, tid: &str) -> Result<Value, AppError> {
     let mut q = c.prepare("SELECT revision,status,anchor,reason FROM placements WHERE thread=?")?;
     let placements=q.query_map([tid],|r|{let a:String=r.get(2)?;Ok(json!({"revision_id":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"anchor":serde_json::from_str::<Value>(&a).unwrap_or(json!({})),"reason":r.get::<_,String>(3)?,"algorithm":"conservative-v1"}))})?.collect::<Result<Vec<_>,_>>()?;
     v["state"] = json!(thread_state(c, tid)?);
+    if v["state"] == "archived" {
+        v["state"] = json!("active");
+        v["resolved"] = json!(true);
+    }
     v["origin_deleted"] = json!(c.query_row(
         "SELECT EXISTS(SELECT 1 FROM deleted_revisions WHERE revision=?)",
         [&v["original_revision"].as_str().unwrap_or("")],

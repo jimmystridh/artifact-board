@@ -59,7 +59,7 @@ async function harness(initialThreads, fetcher, config = {}) {
  ids.forEach(id => { const node = new Element(id === 'comment-form' ? 'form' : id === 'comment-body' ? 'textarea' : 'div'); node.id = id; app.append(node); });
  const identity = new Element('p'); identity.className = 'identity-note'; app.append(identity);
  const filters = {};
- for (const name of ['open', 'resolved', 'unmatched', 'archived']) { const button = new Element('button'); button.dataset.threadFilter = name; app.append(button); filters[name] = button; }
+ for (const name of ['open', 'resolved', 'unmatched']) { const button = new Element('button'); button.dataset.threadFilter = name; app.append(button); filters[name] = button; }
  const $ = selector => body.querySelector(selector);
  $('#review-hidden-notice').hidden = true; $('#review-intro').hidden = true; $('#guest-name').value = 'Guest'; const bridgeMessages=[]; $('#artifact-frame').contentWindow = { postMessage(data) { bridgeMessages.push(data); } };
  const submit = new Element('button'); submit.type = 'submit'; $('#comment-form').append(submit);
@@ -574,20 +574,24 @@ test('general position hints are source-bound and never placed on a newer revisi
  h.bridge({type:'position',anchor:{...positionAnchor(),position:{y:Infinity}}});h.$('#general-comment').onclick();assert.equal(h.$('#anchor-preview').textContent,'');
 });
 
-test('archived discussions are browseable but excluded from launcher and document markers',async()=>{
- const archived={...thread('archive'),state:'archived'};archived.comments.push({id:'reply',body:'Archived reply'});const deleted={...thread('deleted'),state:'deleted'};
- const h=await harness([thread('active'),archived,deleted],()=>response([]));h.bridge({type:'ready'});
- assert.equal(h.$('#comment-count').textContent,'1');assert.equal(h.card('archive'),undefined);assert.equal(h.card('deleted'),undefined);assert.deepEqual(Array.from(h.bridgeMessages.findLast(m=>m.type==='placements').threads,t=>t.id),['active']);
- h.filters.archived.onclick();assert.ok(h.card('archive'));assert.equal(h.action('archive','Reply').hidden,true);assert.ok(h.action('archive','Restore'));assert.ok(h.action('archive','Delete…'));assert.equal(h.$('#comment-count').textContent,'1');
+test('resolved discussions have delete and reopen controls and do not count as open comments',async()=>{
+ const resolved={...thread('done'),resolved:true};resolved.comments.push({id:'reply',body:'A reply'});
+ const h=await harness([thread('active'),resolved],()=>response([]));h.bridge({type:'ready'});
+ assert.equal(h.$('#comment-count').textContent,'1');assert.equal(h.card('done'),undefined);assert.equal(h.action('active','Delete…'),undefined);assert.equal(h.action('active','Archive'),undefined);
+ assert.deepEqual(Array.from(h.bridgeMessages.findLast(m=>m.type==='placements').threads,t=>t.id),['active']);
+ h.filters.resolved.onclick();assert.ok(h.card('done'));assert.ok(h.action('done','Reopen'));assert.ok(h.action('done','Delete…'));assert.equal(h.$('#comment-count').textContent,'1');
 });
-test('archiving and restoring update counts immediately from acknowledgement without a refresh',async()=>{
- const one=thread('one');one.comments.push({id:'reply',body:'Second'});const h=await harness([one],call=>response({id:'one',state:call.body.action==='archive'?'archived':'active'}));
- await h.action('one','Archive').onclick();assert.equal(h.$('#comment-count').hidden,true);assert.equal(h.card('one'),undefined);
- h.filters.archived.onclick();await h.action('one','Restore').onclick();assert.equal(h.$('#comment-count').textContent,'2');assert.equal(h.card('one'),undefined);assert.equal(h.calls.length,2);assert.ok(h.calls.every(c=>c.method==='POST'));
+test('resolving and reopening update counts from the acknowledgement without a refresh',async()=>{
+ const one=thread('one');one.comments.push({id:'reply',body:'Second'});const h=await harness([one],call=>response({...one,resolved:call.body.resolved}));
+ await h.action('one','Resolve').onclick();assert.equal(h.$('#comment-count').hidden,true);assert.equal(h.card('one'),undefined);
+ h.filters.resolved.onclick();await h.action('one','Reopen').onclick();assert.equal(h.$('#comment-count').textContent,'2');assert.equal(h.card('one'),undefined);assert.equal(h.calls.length,2);assert.ok(h.calls.every(c=>c.method==='POST'));
 });
-test('deleting an archived discussion requires confirmation and removes it from all filters',async()=>{
- const h=await harness([{...thread('one'),state:'archived'}],()=>response({id:'one',state:'deleted'}));h.filters.archived.onclick();h.action('one','Delete…').onclick();assert.equal(h.calls.length,0);assert.equal(h.$('#review-confirm').open,true);assert.match(h.$('#review-confirm-message').textContent,/all its replies/);
+test('deleting a resolved discussion requires confirmation and removes it from all filters',async()=>{
+ const h=await harness([{...thread('one'),resolved:true}],()=>response({id:'one',state:'deleted'}));h.filters.resolved.onclick();h.action('one','Delete…').onclick();assert.equal(h.calls.length,0);assert.equal(h.$('#review-confirm').open,true);assert.match(h.$('#review-confirm-message').textContent,/all its replies/);
  h.$('#review-confirm-cancel').onclick();assert.equal(h.calls.length,0);h.action('one','Delete…').onclick();await h.$('#review-confirm-submit').onclick();assert.equal(h.card('one'),undefined);assert.equal(h.$('#review-confirm').open,false);assert.equal(h.$('#comment-count').hidden,true);
+});
+test('reviewers cannot delete or reopen resolved discussions',async()=>{
+ const h=await harness([{...thread('one'),resolved:true}],()=>response({}),{boot:{is_owner:false,can_manage:false}});h.filters.resolved.onclick();assert.equal(h.action('one','Delete…'),undefined);assert.equal(h.action('one','Reopen'),undefined);
 });
 test('revision navigation exposes earlier versions and owner deletion goes back to latest only after acknowledgement',async()=>{
  const boot={is_owner:true,share:{id:'share-1',latest_revision:'revision-2',revisions:[{id:'revision-1',created_at:1},{id:'revision-2',created_at:2}]}};
@@ -596,7 +600,7 @@ test('revision navigation exposes earlier versions and owner deletion goes back 
  const viewer=await harness([],()=>response({}),{boot:{...boot,is_owner:false,can_manage:false}});assert.equal(viewer.$('#delete-revision').onclick,undefined);viewer.$('#revision-picker').value='revision-2';viewer.$('#revision-picker').onchange();assert.equal(viewer.location.href,'/s/review-token');
 });
 test('failed deletion stays reviewable in the dialog and does not navigate or discard comments',async()=>{
- const h=await harness([{...thread('one'),state:'archived'}],()=>failure('Try again'));h.filters.archived.onclick();h.action('one','Delete…').onclick();await h.$('#review-confirm-submit').onclick();assert.ok(h.card('one'));assert.equal(h.$('#review-confirm').open,true);assert.match(h.$('#review-confirm-error').textContent,/Try again/);assert.equal(h.$('#review-confirm-submit').disabled,false);
+ const h=await harness([{...thread('one'),resolved:true}],()=>failure('Try again'));h.filters.resolved.onclick();h.action('one','Delete…').onclick();await h.$('#review-confirm-submit').onclick();assert.ok(h.card('one'));assert.equal(h.$('#review-confirm').open,true);assert.match(h.$('#review-confirm-error').textContent,/Try again/);assert.equal(h.$('#review-confirm-submit').disabled,false);
 });
 
 test('composer makes room for discussion, opens for new comments, and preserves restored drafts',async()=>{
@@ -604,14 +608,14 @@ test('composer makes room for discussion, opens for new comments, and preserves 
  const restored=await harness([],()=>response([]),{storage:h.storage});assert.equal(restored.$('#comment-composer-panel').open,true);assert.equal(restored.$('#comment-body').value,'Keep my thought');
 });
 
-test('an older refresh cannot restore an archived discussion to the active count',async()=>{
- const pending=deferred(),one=thread('one'),h=await harness([one],call=>call.method==='GET'?pending.promise:response({id:'one',state:'archived'}));
- const refresh=h.$('#refresh-discussion').onclick();await h.action('one','Archive').onclick();pending.resolve(response([one]));await refresh;
- assert.equal(h.$('#comment-count').hidden,true);assert.equal(h.card('one'),undefined);h.filters.archived.onclick();assert.ok(h.card('one'));
+test('an older refresh cannot undo resolution or restore the open comment count',async()=>{
+ const pending=deferred(),one=thread('one'),h=await harness([one],call=>call.method==='GET'?pending.promise:response({...one,resolved:true}));
+ const refresh=h.$('#refresh-discussion').onclick();await h.action('one','Resolve').onclick();pending.resolve(response([one]));await refresh;
+ assert.equal(h.$('#comment-count').hidden,true);assert.equal(h.card('one'),undefined);h.filters.resolved.onclick();assert.ok(h.card('one'));
 });
 
 test('Escape in a deletion dialog leaves the underlying review panel open',async()=>{
- const h=await harness([{...thread('one'),state:'archived'}],()=>response({}));h.$('#toggle-discussion').onclick();h.filters.archived.onclick();h.action('one','Delete…').onclick();h.keyListeners.keydown({key:'Escape'});assert.equal(h.$('#discussion-panel').hidden,false);
+ const h=await harness([{...thread('one'),resolved:true}],()=>response({}));h.$('#toggle-discussion').onclick();h.filters.resolved.onclick();h.action('one','Delete…').onclick();h.keyListeners.keydown({key:'Escape'});assert.equal(h.$('#discussion-panel').hidden,false);
 });
 
 test('viewing an earlier version describes later discussion origins without reversing their chronology',async()=>{
